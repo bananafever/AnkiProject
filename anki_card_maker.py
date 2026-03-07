@@ -8,19 +8,21 @@ Anki 카드 자동 생성기
   python anki_card_maker.py
 
 사전 준비:
-  1. pip install google-generativeai requests
+  1. pip install google-genai requests python-dotenv
   2. Anki 실행 + AnkiConnect 애드온 설치 (코드: 2055492159)
-  3. config.py에 Gemini API 키 입력
+  3. .env 파일에 GEMINI_API_KEY 입력
+
 """
 
 import requests
 import json
-import google.generativeai as genai
+from google import genai
+from google.genai import errors as genai_errors
 from config import GEMINI_API_KEY, ANKI_DECK_NAME, ANKI_MODEL_NAME
 
 # ── Gemini 설정 ────────────────────────────────────────────────
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_ID = "gemini-2.5-flash"  # 최신 모델로 업데이트
 
 
 # ── 1. Gemini로 카드 내용 생성 ──────────────────────────────────
@@ -62,8 +64,18 @@ def generate_card(topic: str) -> dict:
   "BlankSentence": "<div style='line-height:1.6;'>예문1 _____ 예문1 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 1</span><br><br>예문2 _____ 예문2 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 2</span></div>"
 }}
 """
-    response = model.generate_content(prompt)
-    text = response.text.strip()
+    try:
+        response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=prompt
+        )
+        text = response.text.strip()
+    except Exception as e:
+        # google-genai는 다양한 예외를 던질 수 있음. 
+        # 한도 초과(429) 또는 기타 오류 처리
+        if "429" in str(e) or "quota" in str(e).lower():
+            raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
+        raise e
 
     # 마크다운 코드블록 제거 (```json ... ``` 형태 대응)
     if text.startswith("```"):
