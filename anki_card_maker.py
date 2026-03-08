@@ -85,6 +85,58 @@ def generate_card(topic: str) -> dict:
     return json.loads(text)
 
 
+def generate_cards_batch(topics: list) -> list:
+    """
+    여러 단어/표현을 한 번의 API 호출로 카드 내용 생성 (RPD 절약)
+    Returns: list of card dicts
+    """
+    topics_str = "\n".join(f"- {t}" for t in topics)
+
+    prompt = f"""
+아래 단어/표현 목록 각각에 대해 Anki 플래시카드 내용을 만들어주세요.
+
+단어/표현 목록:
+{topics_str}
+
+[작성 규칙]
+- HTML style 속성은 반드시 작은따옴표(')를 사용하세요. (JSON 파싱 오류 방지)
+- 각 단어의 FullSentence와 BlankSentence는 동일한 문장을 사용하며,
+  BlankSentence는 해당 단어/표현 부분만 _____로 교체합니다.
+- 반드시 아래 JSON 배열 형식으로만 답하세요. 다른 말 없이 JSON 배열만 출력하세요.
+
+[
+  {{
+    "Word/Phrase": "단어",
+    "Outline": "① 사용 빈도: (높음/중간/낮음 및 한 줄 설명)\\n② 뉘앙스: (격식체/비격식, 긍정/부정 등)\\n③ 문맥 및 배경: (주로 쓰이는 상황)",
+    "KR_Definition": "① [품사] 뜻 1\\n② [품사] 뜻 2\\n③ [품사] 뜻 3",
+    "EN_Definition": "① (Part of Speech) Definition 1\\n② (Part of Speech) Definition 2\\n③ (Part of Speech) Definition 3",
+    "FullSentence": "<div style='line-height:1.6;'>예문1 <span style='color:#FFD54F'>단어</span> 예문1 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 1</span><br><br>예문2 <span style='color:#FFD54F'>단어</span> 예문2 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 2</span></div>",
+    "BlankSentence": "<div style='line-height:1.6;'>예문1 _____ 예문1 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 1</span><br><br>예문2 _____ 예문2 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 2</span></div>"
+  }},
+  ...
+]
+
+총 {len(topics)}개의 카드를 위 형식의 JSON 배열로 반환하세요.
+"""
+    try:
+        response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=prompt
+        )
+        text = response.text.strip()
+    except Exception as e:
+        if "429" in str(e) or "quota" in str(e).lower():
+            raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
+        raise e
+
+    # 마크다운 코드블록 제거
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1])
+
+    return json.loads(text)
+
+
 # ── 2. AnkiConnect로 카드 추가 ─────────────────────────────────
 ANKI_URL = "http://localhost:8765"
 

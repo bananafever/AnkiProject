@@ -1,6 +1,6 @@
 import sys
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QLabel, QTextEdit, QMessageBox, QDialog,
     QScrollArea
 )
@@ -31,7 +31,7 @@ class ResultWindow(QDialog):
         scroll.setWidgetResizable(True)
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
-        
+
         fields = [
             ("Word/Phrase", "Word/Phrase"),
             ("Outline", "Outline"),
@@ -46,7 +46,7 @@ class ResultWindow(QDialog):
             label = QLabel(label_text)
             label.setObjectName("fieldLabel")
             scroll_layout.addWidget(label)
-            
+
             edit = QTextEdit()
             edit.setPlainText(str(self.card_data.get(key, "")))
             edit.setMinimumHeight(100)
@@ -59,11 +59,11 @@ class ResultWindow(QDialog):
         btn_layout = QHBoxLayout()
         self.btn_add = QPushButton("Anki에 추가")
         self.btn_add.clicked.connect(self.add_to_anki)
-        
+
         self.btn_cancel = QPushButton("취소")
         self.btn_cancel.setObjectName("secondaryButton")
         self.btn_cancel.clicked.connect(self.reject)
-        
+
         btn_layout.addWidget(self.btn_cancel)
         btn_layout.addWidget(self.btn_add)
         layout.addLayout(btn_layout)
@@ -92,7 +92,7 @@ class ResultWindow(QDialog):
 
             # Ensure deck exists
             anki_card_maker.ensure_deck_exists(anki_card_maker.ANKI_DECK_NAME)
-            
+
             note_id = anki_card_maker.add_note(anki_fields)
             QMessageBox.information(self, "Success", f"성공적으로 추가되었습니다!\n노트 ID: {note_id}")
             self.accept()
@@ -118,13 +118,13 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        subtitle = QLabel("Gemini AI를 이용한 영어 단어장 자동 생성")
+        subtitle = QLabel("Gemini AI를 이용한 영어 단어장 자동 생성\n여러 단어는 쉼표로 구분하세요 (예: apple, run away, on purpose)\n안정적인 생성을 위해 한 번에 최대 10개를 권장합니다.")
         subtitle.setObjectName("infoLabel")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
 
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("단어나 표현을 입력하세요...")
+        self.input_field.setPlaceholderText("단어나 표현 입력 (쉼표로 구분 가능: apple, banana, cherry)")
         self.input_field.returnPressed.connect(self.generate)
         layout.addWidget(self.input_field)
 
@@ -136,34 +136,55 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
     def generate(self):
-        topic = self.input_field.text().strip()
-        if not topic:
+        raw_input = self.input_field.text().strip()
+        if not raw_input:
+            QMessageBox.warning(self, "Warning", "단어를 입력해주세요.")
+            return
+
+        # 쉼표로 구분된 단어 목록 파싱
+        topics = [t.strip() for t in raw_input.split(",") if t.strip()]
+        if not topics:
             QMessageBox.warning(self, "Warning", "단어를 입력해주세요.")
             return
 
         self.btn_generate.setEnabled(False)
-        self.btn_generate.setText("생성 중...")
+        count = len(topics)
+        self.btn_generate.setText(f"생성 중... (0/{count})")
         QApplication.processEvents()
 
         try:
-            # Check Anki Connection first
+            # Anki 연결 확인
             anki_card_maker.anki_request("version")
-            
-            # Generate Card
-            card_data = anki_card_maker.generate_card(topic)
-            
-            # Show Result Window
-            res_win = ResultWindow(card_data, self)
-            res_win.setStyleSheet(STYLES) # Apply styles to dialog too
-            if res_win.exec():
+
+            # 단어 수에 따라 단일/배치 생성 분기
+            if count == 1:
+                cards_data = [anki_card_maker.generate_card(topics[0])]
+            else:
+                self.btn_generate.setText(f"생성 중... (API 호출 1회로 {count}개 처리)")
+                QApplication.processEvents()
+                cards_data = anki_card_maker.generate_cards_batch(topics)
+
+            # 각 카드를 순서대로 미리보기 창에 표시
+            added_count = 0
+            for i, card_data in enumerate(cards_data):
+                self.btn_generate.setText(f"검토 중... ({i + 1}/{count})")
+                QApplication.processEvents()
+
+                res_win = ResultWindow(card_data, self)
+                res_win.setStyleSheet(STYLES)
+                if res_win.exec():
+                    added_count += 1
+
+            if added_count > 0:
                 self.input_field.clear()
-            
+                QMessageBox.information(self, "완료", f"{added_count}개의 카드가 Anki에 추가되었습니다.")
+
         except ConnectionError as e:
             QMessageBox.critical(self, "Anki Connection Error", str(e))
         except Exception as e:
             error_msg = str(e)
             if "Gemini API 사용 한도" in error_msg:
-                QMessageBox.warning(self, "Gemini 사용 한도 초과", 
+                QMessageBox.warning(self, "Gemini 사용 한도 초과",
                                   "Gemini API의 무료 티어 사용량 제한(Rate Limit)에 도달했습니다.\n"
                                   "잠시(약 1분) 후 다시 시도해주세요.")
             else:
@@ -175,8 +196,8 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLES)
-    
+
     window = MainWindow()
     window.show()
-    
+
     sys.exit(app.exec())
