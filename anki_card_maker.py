@@ -19,6 +19,7 @@ import json
 from google import genai
 from google.genai import errors as genai_errors
 from config import GEMINI_API_KEY, ANKI_DECK_NAME, ANKI_MODEL_NAME
+import api_counter
 
 # ── Gemini 설정 ────────────────────────────────────────────────
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -70,8 +71,9 @@ def generate_card(topic: str) -> dict:
             contents=prompt
         )
         text = response.text.strip()
+        api_counter.increment()  # 성공 시 카운터 증가
     except Exception as e:
-        # google-genai는 다양한 예외를 던질 수 있음. 
+        # google-genai는 다양한 예외를 던질 수 있음.
         # 한도 초과(429) 또는 기타 오류 처리
         if "429" in str(e) or "quota" in str(e).lower():
             raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
@@ -124,6 +126,7 @@ def generate_cards_batch(topics: list) -> list:
             contents=prompt
         )
         text = response.text.strip()
+        api_counter.increment()  # 성공 시 카운터 증가
     except Exception as e:
         if "429" in str(e) or "quota" in str(e).lower():
             raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")

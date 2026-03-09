@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 import anki_card_maker
+import api_counter
 from styles import STYLES
 
 class ResultWindow(QDialog):
@@ -123,6 +124,12 @@ class MainWindow(QMainWindow):
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
 
+        self.counter_label = QLabel()
+        self.counter_label.setObjectName("infoLabel")
+        self.counter_label.setAlignment(Qt.AlignCenter)
+        self._update_counter_label()
+        layout.addWidget(self.counter_label)
+
         self.input_field = QLineEdit()
         self.input_field.setPlaceholderText("단어나 표현 입력 (쉼표로 구분 가능: apple, banana, cherry)")
         self.input_field.returnPressed.connect(self.generate)
@@ -134,6 +141,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.btn_generate)
 
         layout.addStretch()
+
+    def _update_counter_label(self):
+        count = api_counter.get_count()
+        limit = api_counter.DAILY_LIMIT
+        next_reset = api_counter.get_next_reset_str()
+        self.counter_label.setText(f"오늘 API 사용: {count} / {limit}  (리셋: {next_reset} KST)")
 
     def generate(self):
         raw_input = self.input_field.text().strip()
@@ -192,6 +205,7 @@ class MainWindow(QMainWindow):
         finally:
             self.btn_generate.setEnabled(True)
             self.btn_generate.setText("카드 생성하기")
+            self._update_counter_label()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
