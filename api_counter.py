@@ -8,11 +8,21 @@ import json
 import os
 from datetime import datetime, timezone, timedelta
 
+import sys
+
 KST = timezone(timedelta(hours=9))
 RESET_HOUR = 17       # KST 오후 5시
 DAILY_LIMIT = 20
 
-COUNTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_usage.json")
+def _get_base_dir() -> str:
+    """exe로 실행 시엔 exe 위치 폴더, py로 실행 시엔 소스 폴더 반환"""
+    if getattr(sys, "frozen", False):
+        # PyInstaller로 패키징된 exe 실행 중
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+COUNTER_FILE = os.path.join(_get_base_dir(), "api_usage.json")
 
 
 def _get_current_period_start() -> datetime:
