@@ -106,6 +106,19 @@ QScrollBar::handle:vertical:hover {{
     background: {COLOR_TEXT_DIM};
 }}
 
+QProgressBar {{
+    background-color: {COLOR_SURFACE};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 4px;
+    height: 8px;
+    text-align: center;
+}}
+
+QProgressBar::chunk {{
+    background-color: {COLOR_PRIMARY};
+    border-radius: 4px;
+}}
+
 QMessageBox {{
     background-color: {COLOR_SURFACE};
 }}

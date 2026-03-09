@@ -4,10 +4,10 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QLabel, QTextEdit, QMessageBox, QDialog,
     QScrollArea
 )
-from PySide6.QtCore import Qt
-
 import anki_card_maker
 import api_counter
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtWidgets import QProgressBar
 from styles import STYLES
 
 class ResultWindow(QDialog):
@@ -132,13 +132,25 @@ class MainWindow(QMainWindow):
 
         self.input_field = QLineEdit()
         self.input_field.setPlaceholderText("단어나 표현 입력 (쉼표로 구분 가능: apple, banana, cherry)")
-        self.input_field.returnPressed.connect(self.generate)
+        self.input_field.returnPressed.connect(self.start_generation)
         layout.addWidget(self.input_field)
 
         self.btn_generate = QPushButton("카드 생성하기")
-        self.btn_generate.clicked.connect(self.generate)
+        self.btn_generate.clicked.connect(self.start_generation)
         self.btn_generate.setCursor(Qt.PointingHandCursor)
         layout.addWidget(self.btn_generate)
+
+        # Progress Section
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("infoLabel")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setVisible(False)
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(False)
+        layout.addWidget(self.progress_bar)
 
         layout.addStretch()
 
@@ -148,64 +160,118 @@ class MainWindow(QMainWindow):
         next_reset = api_counter.get_next_reset_str()
         self.counter_label.setText(f"오늘 API 사용: {count} / {limit}  (리셋: {next_reset} KST)")
 
-    def generate(self):
+    def start_generation(self):
         raw_input = self.input_field.text().strip()
         if not raw_input:
             QMessageBox.warning(self, "Warning", "단어를 입력해주세요.")
             return
 
-        # 쉼표로 구분된 단어 목록 파싱
         topics = [t.strip() for t in raw_input.split(",") if t.strip()]
         if not topics:
             QMessageBox.warning(self, "Warning", "단어를 입력해주세요.")
             return
 
+        # UI State - Generation Start
         self.btn_generate.setEnabled(False)
-        count = len(topics)
-        self.btn_generate.setText(f"생성 중... (0/{count})")
-        QApplication.processEvents()
+        self.input_field.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, len(topics))
+        self.progress_bar.setValue(0)
+        self.status_label.setVisible(True)
+        self.status_label.setText(f"준비 중... (0/{len(topics)})")
 
+        # Worker Thread
+        self.worker = GenerationWorker(topics)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.handle_results)
+        self.worker.error.connect(self.handle_error)
+        self.worker.start()
+
+    def update_progress(self, current, total, text):
+        self.progress_bar.setValue(current)
+        self.status_label.setText(text)
+
+    def handle_results(self, cards_data):
+        self.progress_bar.setVisible(False)
+        self.status_label.setVisible(False)
+        
+        count = len(cards_data)
+        added_count = 0
+        
         try:
-            # Anki 연결 확인
-            anki_card_maker.anki_request("version")
-
-            # 단어 수에 따라 단일/배치 생성 분기
-            if count == 1:
-                cards_data = [anki_card_maker.generate_card(topics[0])]
-            else:
-                self.btn_generate.setText(f"생성 중... (API 호출 1회로 {count}개 처리)")
-                QApplication.processEvents()
-                cards_data = anki_card_maker.generate_cards_batch(topics)
-
-            # 각 카드를 순서대로 미리보기 창에 표시
-            added_count = 0
             for i, card_data in enumerate(cards_data):
                 self.btn_generate.setText(f"검토 중... ({i + 1}/{count})")
-                QApplication.processEvents()
-
                 res_win = ResultWindow(card_data, self)
                 res_win.setStyleSheet(STYLES)
                 if res_win.exec():
                     added_count += 1
-
+            
             if added_count > 0:
                 self.input_field.clear()
                 QMessageBox.information(self, "완료", f"{added_count}개의 카드가 Anki에 추가되었습니다.")
-
-        except ConnectionError as e:
-            QMessageBox.critical(self, "Anki Connection Error", str(e))
-        except Exception as e:
-            error_msg = str(e)
-            if "Gemini API 사용 한도" in error_msg:
-                QMessageBox.warning(self, "Gemini 사용 한도 초과",
-                                  "Gemini API의 무료 티어 사용량 제한(Rate Limit)에 도달했습니다.\n"
-                                  "잠시(약 1분) 후 다시 시도해주세요.")
-            else:
-                QMessageBox.critical(self, "Error", f"오류가 발생했습니다: {e}")
         finally:
-            self.btn_generate.setEnabled(True)
-            self.btn_generate.setText("카드 생성하기")
-            self._update_counter_label()
+            self.finalize_generation()
+
+    def handle_error(self, error_msg):
+        self.progress_bar.setVisible(False)
+        self.status_label.setVisible(False)
+        
+        if "Gemini API 사용 한도" in error_msg:
+            QMessageBox.warning(self, "Gemini 사용 한도 초과",
+                              "Gemini API의 무료 티어 사용량 제한(Rate Limit)에 도달했습니다.\n"
+                              "잠시(약 1분) 후 다시 시도해주세요.")
+        elif "Anki" in error_msg:
+            QMessageBox.critical(self, "Anki Connection Error", error_msg)
+        else:
+            QMessageBox.critical(self, "Error", f"오류가 발생했습니다: {error_msg}")
+        
+        self.finalize_generation()
+
+    def finalize_generation(self):
+        self.btn_generate.setEnabled(True)
+        self.btn_generate.setText("카드 생성하기")
+        self.input_field.setEnabled(True)
+        self._update_counter_label()
+
+class GenerationWorker(QThread):
+    progress = Signal(int, int, str)
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, topics):
+        super().__init__()
+        self.topics = topics
+
+    def run(self):
+        try:
+            # Check Anki connection first
+            import anki_card_maker
+            anki_card_maker.anki_request("version")
+
+            all_cards = []
+            # Split into batches of 3 for better progress feedback
+            batch_size = 3
+            total_count = len(self.topics)
+            
+            for i in range(0, total_count, batch_size):
+                batch = self.topics[i:i + batch_size]
+                current_count = len(all_cards)
+                
+                status_text = f"생성 중... ({current_count}/{total_count})"
+                self.progress.emit(current_count, total_count, status_text)
+                
+                if len(batch) == 1:
+                    card = anki_card_maker.generate_card(batch[0])
+                    all_cards.append(card)
+                else:
+                    cards = anki_card_maker.generate_cards_batch(batch)
+                    all_cards.extend(cards)
+            
+            self.progress.emit(total_count, total_count, "생성 완료!")
+            self.finished.emit(all_cards)
+            
+        except Exception as e:
+            self.error.emit(str(e))
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
