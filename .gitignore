@@ -155,3 +155,4 @@ cython_debug/
 # Project Specific
 config.py
 debug_import.py
+api_usage.json
