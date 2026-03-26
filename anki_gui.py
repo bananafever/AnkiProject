@@ -2,13 +2,13 @@ import sys
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QLabel, QTextEdit, QMessageBox, QDialog,
-    QScrollArea
+    QScrollArea, QCheckBox
 )
 import anki_card_maker
 import api_counter
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import QProgressBar
-from styles import STYLES
+from styles import get_styles
 
 class ResultWindow(QDialog):
     def __init__(self, card_data, parent=None):
@@ -130,6 +130,11 @@ class MainWindow(QMainWindow):
         self._update_counter_label()
         layout.addWidget(self.counter_label)
 
+        self.children_mode_checkbox = QCheckBox("어린이용 모드")
+        self.children_mode_checkbox.setToolTip("외설/성적 표현/욕설 관련 내용을 제거합니다.")
+        self.children_mode_checkbox.stateChanged.connect(self._on_mode_changed)
+        layout.addWidget(self.children_mode_checkbox)
+
         self.input_field = QLineEdit()
         self.input_field.setPlaceholderText("단어나 표현 입력 (쉼표로 구분 가능: apple, banana, cherry)")
         self.input_field.returnPressed.connect(self.start_generation)
@@ -153,6 +158,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_bar)
 
         layout.addStretch()
+
+    def _on_mode_changed(self):
+        QApplication.instance().setStyleSheet(get_styles(self.children_mode_checkbox.isChecked()))
 
     def _update_counter_label(self):
         count = api_counter.get_count()
@@ -181,7 +189,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"준비 중... (0/{len(topics)})")
 
         # Worker Thread
-        self.worker = GenerationWorker(topics)
+        self.worker = GenerationWorker(topics, children_mode=self.children_mode_checkbox.isChecked())
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.handle_results)
         self.worker.error.connect(self.handle_error)
@@ -202,7 +210,7 @@ class MainWindow(QMainWindow):
             for i, card_data in enumerate(cards_data):
                 self.btn_generate.setText(f"검토 중... ({i + 1}/{count})")
                 res_win = ResultWindow(card_data, self)
-                res_win.setStyleSheet(STYLES)
+                res_win.setStyleSheet(get_styles(self.children_mode_checkbox.isChecked()))
                 if res_win.exec():
                     added_count += 1
             
@@ -238,9 +246,10 @@ class GenerationWorker(QThread):
     finished = Signal(list)
     error = Signal(str)
 
-    def __init__(self, topics):
+    def __init__(self, topics, children_mode: bool = False):
         super().__init__()
         self.topics = topics
+        self.children_mode = children_mode
 
     def run(self):
         try:
@@ -261,10 +270,10 @@ class GenerationWorker(QThread):
                 self.progress.emit(current_count, total_count, status_text)
                 
                 if len(batch) == 1:
-                    card = anki_card_maker.generate_card(batch[0])
+                    card = anki_card_maker.generate_card(batch[0], children_mode=self.children_mode)
                     all_cards.append(card)
                 else:
-                    cards = anki_card_maker.generate_cards_batch(batch)
+                    cards = anki_card_maker.generate_cards_batch(batch, children_mode=self.children_mode)
                     all_cards.extend(cards)
             
             self.progress.emit(total_count, total_count, "생성 완료!")
@@ -275,7 +284,7 @@ class GenerationWorker(QThread):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyleSheet(STYLES)
+    app.setStyleSheet(get_styles())
 
     window = MainWindow()
     window.show()

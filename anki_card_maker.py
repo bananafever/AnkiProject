@@ -28,7 +28,7 @@ MODEL_ID = "gemini-2.5-flash"  # 최신 모델로 업데이트
 
 # ── 1. Gemini로 카드 내용 생성 ──────────────────────────────────
 
-def generate_card(topic: str) -> dict:
+def generate_card(topic: str, children_mode: bool = False) -> dict:
     """
     단어/표현 1개로 노트에 필요한 모든 필드 생성
     Gem 지침과 동일한 포맷으로 생성 (섹션 3, 7 제외)
@@ -40,11 +40,20 @@ def generate_card(topic: str) -> dict:
       FullSentence   ← 섹션 5. 예문 (HTML)
       BlankSentence  ← 섹션 6. 빈칸 예문 (HTML)
     """
+    children_rule = """
+[어린이 모드 규칙]
+- 모든 정의, 설명, 예문에서 성적 표현, 외설적 내용, 욕설을 완전히 제거한다.
+- 예문은 어린이에게 적합한 일상적/교육적 상황으로만 구성한다.
+- 성인 주제(음주, 도박, 폭력, 성인 관계 등)를 다루는 예문은 중립적 상황으로 대체한다.
+- 어린이 모드임을 언급하거나 특정 내용을 제외했음을 설명하는 문구를 절대 포함하지 않는다.
+  (예: "어린이 모드에서는 ~", "성적인 의미를 제외하고 ~" 등의 표현 금지)
+""" if children_mode else ""
+
     prompt = f"""
 아래 단어/표현으로 Anki 플래시카드 내용을 만들어주세요.
 
 단어/표현: {topic}
-
+{children_rule}
 [작성 규칙]
 - HTML style 속성은 반드시 작은따옴표(')를 사용하세요. (JSON 파싱 오류 방지)
 - Outline에는 '사용 빈도', '사용시 유의 사항', '뉘앙스', '문맥 및 배경' 4가지를 모두 반드시 포함하여 작성하세요.
@@ -90,19 +99,28 @@ def generate_card(topic: str) -> dict:
     return json.loads(text)
 
 
-def generate_cards_batch(topics: list) -> list:
+def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
     """
     여러 단어/표현을 한 번의 API 호출로 카드 내용 생성 (RPD 절약)
     Returns: list of card dicts
     """
     topics_str = "\n".join(f"- {t}" for t in topics)
 
+    children_rule = """
+[어린이 모드 규칙]
+- 모든 정의, 설명, 예문에서 성적 표현, 외설적 내용, 욕설을 완전히 제거한다.
+- 예문은 어린이에게 적합한 일상적/교육적 상황으로만 구성한다.
+- 성인 주제(음주, 도박, 폭력, 성인 관계 등)를 다루는 예문은 중립적 상황으로 대체한다.
+- 어린이 모드임을 언급하거나 특정 내용을 제외했음을 설명하는 문구를 절대 포함하지 않는다.
+  (예: "어린이 모드에서는 ~", "성적인 의미를 제외하고 ~" 등의 표현 금지)
+""" if children_mode else ""
+
     prompt = f"""
 아래 단어/표현 목록 각각에 대해 Anki 플래시카드 내용을 만들어주세요.
 
 단어/표현 목록:
 {topics_str}
-
+{children_rule}
 [작성 규칙]
 - HTML style 속성은 반드시 작은따옴표(')를 사용하세요. (JSON 파싱 오류 방지)
 - Outline에는 각 단어별로 '사용 빈도', '사용시 유의 사항', '뉘앙스', '문맥 및 배경' 4가지를 모두 반드시 포함하여 작성하세요.
