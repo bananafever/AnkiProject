@@ -16,6 +16,7 @@ Anki 카드 자동 생성기
 
 import requests
 import json
+import time
 from google import genai
 from google.genai import errors as genai_errors
 from config import GEMINI_API_KEY, ANKI_DECK_NAME, ANKI_MODEL_NAME
@@ -77,19 +78,29 @@ def generate_card(topic: str, children_mode: bool = False) -> dict:
   "BlankSentence": "<div style='line-height:1.6;'>예문1 _____ 예문1 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 1</span><br><br>예문2 _____ 예문2 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 2</span></div>"
 }}
 """
-    try:
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=prompt
-        )
-        text = response.text.strip()
-        api_counter.increment()  # 성공 시 카운터 증가
-    except Exception as e:
-        # google-genai는 다양한 예외를 던질 수 있음.
-        # 한도 초과(429) 또는 기타 오류 처리
-        if "429" in str(e) or "quota" in str(e).lower():
-            raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
-        raise e
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=prompt
+            )
+            text = response.text.strip()
+            api_counter.increment()  # 성공 시 카운터 증가
+            break
+        except Exception as e:
+            error_str = str(e).lower()
+            if "503" in error_str or "unavailable" in error_str or "429" in error_str:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # 1초, 2초 후 재시도
+                    continue
+                
+            # google-genai는 다양한 예외를 던질 수 있음.
+            # 한도 초과(429) 또는 기타 오류 처리
+            if "429" in error_str or "quota" in error_str:
+                raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
+            elif "503" in error_str or "unavailable" in error_str:
+                raise RuntimeError("현재 Gemini API 서버에 트래픽이 몰려 일시적으로 사용할 수 없거나 지연되고 있습니다 (503 Unavailable). 잠시 후 다시 시도해주세요.")
+            raise e
 
     # 마크다운 코드블록 제거 (```json ... ``` 형태 대응)
     if text.startswith("```"):
@@ -144,17 +155,27 @@ def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
 
 총 {len(topics)}개의 카드를 위 형식의 JSON 배열로 반환하세요.
 """
-    try:
-        response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=prompt
-        )
-        text = response.text.strip()
-        api_counter.increment()  # 성공 시 카운터 증가
-    except Exception as e:
-        if "429" in str(e) or "quota" in str(e).lower():
-            raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
-        raise e
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=prompt
+            )
+            text = response.text.strip()
+            api_counter.increment()  # 성공 시 카운터 증가
+            break
+        except Exception as e:
+            error_str = str(e).lower()
+            if "503" in error_str or "unavailable" in error_str or "429" in error_str:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)  # 1초, 2초 후 재시도
+                    continue
+                
+            if "429" in error_str or "quota" in error_str:
+                raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
+            elif "503" in error_str or "unavailable" in error_str:
+                raise RuntimeError("현재 Gemini API 서버에 트래픽이 몰려 일시적으로 사용할 수 없거나 지연되고 있습니다 (503 Unavailable). 잠시 후 다시 시도해주세요.")
+            raise e
 
     # 마크다운 코드블록 제거
     if text.startswith("```"):
