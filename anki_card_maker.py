@@ -1,8 +1,8 @@
 """
 Anki 카드 자동 생성기
-- Gemini API로 카드 내용 생성
+- Gemini API로 카드 내용 생성 (실패 시 Claude CLI로 자동 폴백)
 - AnkiConnect로 Anki에 카드 추가
-- 노트 유형 "01_EN_Voca_New" 1개로 Card 1(빈칸채우기) + Card 2(단어카드) 자동 생성
+- 노트 유형 "01_EN_Voca_SYS" 1개로 Card 1(빈칸채우기) + Card 2(단어카드) 자동 생성
 
 사용법:
   python anki_card_maker.py
@@ -11,11 +11,16 @@ Anki 카드 자동 생성기
   1. pip install google-genai requests python-dotenv
   2. Anki 실행 + AnkiConnect 애드온 설치 (코드: 2055492159)
   3. .env 파일에 GEMINI_API_KEY 입력
+  4. (선택) Claude CLI 폴백을 쓰려면 claude 로그인
+     npm install -g @anthropic-ai/claude-code
 
 """
 
 import requests
 import json
+import re
+import shutil
+import subprocess
 import time
 from google import genai
 from google.genai import errors as genai_errors
@@ -24,7 +29,131 @@ import api_counter
 
 # ── Gemini 설정 ────────────────────────────────────────────────
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_ID = "gemini-2.5-flash"  # 최신 모델로 업데이트
+MODEL_ID = "gemini-2.5-flash-lite"  # Flash-Lite 모델 적용
+
+# ── Claude CLI 폴백 설정 ───────────────────────────────────────
+CLAUDE_CLI_TIMEOUT = 180  # 초. CLI는 API보다 느리므로 넉넉하게
+
+# 폴백이 일어날 때 호출되는 콜백 (GUI에서 상태 표시용). 인자: 사유 문자열
+on_fallback = None
+
+
+# ── 0. LLM 호출 (Gemini → Claude CLI 폴백) ──────────────────────
+
+def _notify_fallback(reason: str):
+    """폴백 발생을 UI에 알린다. 콜백이 없거나 실패해도 생성은 계속한다."""
+    if on_fallback:
+        try:
+            on_fallback(reason)
+        except Exception:
+            pass
+
+
+def _call_gemini(prompt: str) -> str:
+    """Gemini API 호출. 429/503은 1초, 2초 간격으로 최대 3회 시도."""
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_ID,
+                contents=prompt
+            )
+            api_counter.increment()  # 성공 시 카운터 증가
+            return response.text.strip()
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            is_retryable = ("503" in error_str or "unavailable" in error_str
+                            or "429" in error_str)
+            if is_retryable and attempt < 2:
+                time.sleep(2 ** attempt)  # 1초, 2초 후 재시도
+                continue
+            break
+    raise last_error
+
+
+def _call_claude_cli(prompt: str) -> str:
+    """
+    Claude CLI(`claude -p`)로 생성.
+    - 프롬프트가 길고 개행/따옴표가 많으므로 argv 대신 stdin으로 전달
+    - `--tools ""`로 도구를 모두 끄고 `--strict-mcp-config`로 MCP를 건너뛴다
+      (텍스트 생성만 필요하고, 파일/명령 실행 부작용이 없어야 하며, 시작도 빠르다)
+    """
+    exe = shutil.which("claude")
+    if not exe:
+        raise RuntimeError(
+            "claude CLI를 찾을 수 없습니다.\n"
+            "→ 설치: npm install -g @anthropic-ai/claude-code"
+        )
+
+    try:
+        proc = subprocess.run(
+            [exe, "-p", "--tools", "", "--strict-mcp-config"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=CLAUDE_CLI_TIMEOUT,
+            # 패키징된 GUI(.exe)에서 콘솔 창이 깜빡이지 않도록
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Claude CLI가 {CLAUDE_CLI_TIMEOUT}초 안에 응답하지 않았습니다.")
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise RuntimeError(f"Claude CLI 오류 (종료 코드 {proc.returncode}): {detail}")
+
+    text = (proc.stdout or "").strip()
+    if not text:
+        raise RuntimeError("Claude CLI가 빈 응답을 반환했습니다. (로그인 상태를 확인하세요)")
+    return text
+
+
+def _generate_text(prompt: str) -> str:
+    """Gemini로 먼저 시도하고, 실패하면 Claude CLI로 폴백."""
+    try:
+        return _call_gemini(prompt)
+    except Exception as e:
+        error_str = str(e).lower()
+        if "429" in error_str or "quota" in error_str or "resource_exhausted" in error_str:
+            reason = "Gemini 사용 한도 초과"
+        elif "503" in error_str or "unavailable" in error_str:
+            reason = "Gemini 서버 일시 장애"
+        else:
+            reason = f"Gemini 오류 ({type(e).__name__})"
+
+        _notify_fallback(reason)
+        try:
+            return _call_claude_cli(prompt)
+        except Exception as cli_error:
+            raise RuntimeError(
+                f"{reason}로 Gemini 생성에 실패했고, Claude CLI 폴백도 실패했습니다.\n"
+                f"→ Gemini: {e}\n"
+                f"→ Claude CLI: {cli_error}"
+            ) from cli_error
+
+
+def _extract_json(text: str) -> str:
+    """
+    LLM 응답에서 JSON 본문만 추출.
+    CLI는 코드블록으로 감싸거나 앞뒤에 설명을 덧붙일 수 있다.
+    """
+    text = text.strip()
+
+    # ```json ... ``` 코드블록이 있으면 그 안의 내용을 우선 사용
+    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+
+    # 앞뒤 설명이 붙은 경우 첫 여는 괄호 ~ 마지막 닫는 괄호만 남김
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    ends = [i for i in (text.rfind("}"), text.rfind("]")) if i != -1]
+    if starts and ends and max(ends) > min(starts):
+        text = text[min(starts):max(ends) + 1]
+
+    return text
 
 
 # ── 1. Gemini로 카드 내용 생성 ──────────────────────────────────
@@ -78,36 +207,8 @@ def generate_card(topic: str, children_mode: bool = False) -> dict:
   "BlankSentence": "<div style='line-height:1.6;'>예문1 _____ 예문1 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 1</span><br><br>예문2 _____ 예문2 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 2</span></div>"
 }}
 """
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_ID,
-                contents=prompt
-            )
-            text = response.text.strip()
-            api_counter.increment()  # 성공 시 카운터 증가
-            break
-        except Exception as e:
-            error_str = str(e).lower()
-            if "503" in error_str or "unavailable" in error_str or "429" in error_str:
-                if attempt < 2:
-                    time.sleep(2 ** attempt)  # 1초, 2초 후 재시도
-                    continue
-                
-            # google-genai는 다양한 예외를 던질 수 있음.
-            # 한도 초과(429) 또는 기타 오류 처리
-            if "429" in error_str or "quota" in error_str:
-                raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
-            elif "503" in error_str or "unavailable" in error_str:
-                raise RuntimeError("현재 Gemini API 서버에 트래픽이 몰려 일시적으로 사용할 수 없거나 지연되고 있습니다 (503 Unavailable). 잠시 후 다시 시도해주세요.")
-            raise e
-
-    # 마크다운 코드블록 제거 (```json ... ``` 형태 대응)
-    if text.startswith("```"):
-        lines = text.splitlines()
-        text = "\n".join(lines[1:-1])
-
-    return json.loads(text)
+    text = _generate_text(prompt)
+    return json.loads(_extract_json(text))
 
 
 def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
@@ -155,34 +256,8 @@ def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
 
 총 {len(topics)}개의 카드를 위 형식의 JSON 배열로 반환하세요.
 """
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_ID,
-                contents=prompt
-            )
-            text = response.text.strip()
-            api_counter.increment()  # 성공 시 카운터 증가
-            break
-        except Exception as e:
-            error_str = str(e).lower()
-            if "503" in error_str or "unavailable" in error_str or "429" in error_str:
-                if attempt < 2:
-                    time.sleep(2 ** attempt)  # 1초, 2초 후 재시도
-                    continue
-                
-            if "429" in error_str or "quota" in error_str:
-                raise RuntimeError("Gemini API 사용 한도(Quota)를 초과했습니다. 잠시 후 다시 시도하거나, API 설정을 확인해주세요.")
-            elif "503" in error_str or "unavailable" in error_str:
-                raise RuntimeError("현재 Gemini API 서버에 트래픽이 몰려 일시적으로 사용할 수 없거나 지연되고 있습니다 (503 Unavailable). 잠시 후 다시 시도해주세요.")
-            raise e
-
-    # 마크다운 코드블록 제거
-    if text.startswith("```"):
-        lines = text.splitlines()
-        text = "\n".join(lines[1:-1])
-
-    return json.loads(text)
+    text = _generate_text(prompt)
+    return json.loads(_extract_json(text))
 
 
 # ── 2. AnkiConnect로 카드 추가 ─────────────────────────────────
@@ -214,6 +289,22 @@ def ensure_deck_exists(deck_name: str):
         print(f"  ✅ 덱 생성됨: '{deck_name}'")
 
 
+def get_active_profile() -> str:
+    """현재 Anki에 열려 있는 프로필 이름을 반환"""
+    return anki_request("getActiveProfile")
+
+
+def ensure_model_exists(model_name: str):
+    """노트 유형이 없으면 사용 가능한 목록과 함께 명확한 오류를 발생"""
+    models = anki_request("modelNames")
+    if model_name not in models:
+        raise RuntimeError(
+            f"노트 유형 '{model_name}'을(를) 찾을 수 없습니다.\n"
+            f"현재 프로필: {get_active_profile()}\n"
+            f"사용 가능한 노트 유형: {', '.join(models)}"
+        )
+
+
 def add_note(fields: dict) -> int:
     """노트를 Anki에 추가하고 노트 ID를 반환 (Card 1 + Card 2 자동 생성)"""
     note = {
@@ -240,12 +331,18 @@ def main():
     try:
         version = anki_request("version")
         print(f"  ✅ AnkiConnect 버전: {version}")
+        print(f"  📥 추가 대상: '{get_active_profile()}' 프로필 › '{ANKI_DECK_NAME}' 덱")
     except ConnectionError as e:
         print(f"\n❌ {e}")
         return
 
-    # 덱 준비
+    # 덱 / 노트 유형 준비
     ensure_deck_exists(ANKI_DECK_NAME)
+    try:
+        ensure_model_exists(ANKI_MODEL_NAME)
+    except RuntimeError as e:
+        print(f"\n❌ {e}")
+        return
 
     print("\n단어/표현을 입력하면 카드를 생성합니다. 종료하려면 'q' 입력.\n")
 

@@ -12,5 +12,5 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ANKI_DECK_NAME = "EN_Voca"
 
 # Anki 노트 유형 이름
-ANKI_MODEL_NAME = "01_EN_Voca_New"
+ANKI_MODEL_NAME = "01_EN_Voca_SYS"
 

@@ -11,11 +11,12 @@ from PySide6.QtWidgets import QProgressBar
 from styles import get_styles
 
 class ResultWindow(QDialog):
-    def __init__(self, card_data, parent=None):
+    def __init__(self, card_data, profile_name=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Generation Result")
         self.resize(600, 700)
         self.card_data = card_data
+        self.profile_name = profile_name
         self.init_ui()
 
     def init_ui(self):
@@ -26,6 +27,11 @@ class ResultWindow(QDialog):
         title = QLabel("카드 생성 미리보기")
         title.setObjectName("titleLabel")
         layout.addWidget(title)
+
+        if self.profile_name:
+            target = QLabel(f"📥 '{self.profile_name}' 프로필의 '{anki_card_maker.ANKI_DECK_NAME}' 덱에 추가됩니다")
+            target.setObjectName("infoLabel")
+            layout.addWidget(target)
 
         # Scroll area for content
         scroll = QScrollArea()
@@ -91,11 +97,18 @@ class ResultWindow(QDialog):
                 "Audio":         "",
             }
 
-            # Ensure deck exists
+            # Ensure deck / note type exist
             anki_card_maker.ensure_deck_exists(anki_card_maker.ANKI_DECK_NAME)
+            anki_card_maker.ensure_model_exists(anki_card_maker.ANKI_MODEL_NAME)
 
             note_id = anki_card_maker.add_note(anki_fields)
-            QMessageBox.information(self, "Success", f"성공적으로 추가되었습니다!\n노트 ID: {note_id}")
+            target = self.profile_name or anki_card_maker.get_active_profile()
+            QMessageBox.information(
+                self, "Success",
+                f"성공적으로 추가되었습니다!\n"
+                f"대상: '{target}' › '{anki_card_maker.ANKI_DECK_NAME}'\n"
+                f"노트 ID: {note_id}"
+            )
             self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Anki 추가 중 오류 발생: {e}")
@@ -129,6 +142,12 @@ class MainWindow(QMainWindow):
         self.counter_label.setAlignment(Qt.AlignCenter)
         self._update_counter_label()
         layout.addWidget(self.counter_label)
+
+        self.profile_label = QLabel()
+        self.profile_label.setObjectName("infoLabel")
+        self.profile_label.setAlignment(Qt.AlignCenter)
+        self._update_profile_label()
+        layout.addWidget(self.profile_label)
 
         self.children_mode_checkbox = QCheckBox("어린이용 모드")
         self.children_mode_checkbox.setToolTip("외설/성적 표현/욕설 관련 내용을 제거합니다.")
@@ -168,7 +187,19 @@ class MainWindow(QMainWindow):
         next_reset = api_counter.get_next_reset_str()
         self.counter_label.setText(f"오늘 API 사용: {count} / {limit}  (리셋: {next_reset} KST)")
 
+    def _update_profile_label(self):
+        try:
+            self.active_profile = anki_card_maker.get_active_profile()
+            self.profile_label.setText(
+                f"📥 추가 대상: '{self.active_profile}' 프로필 › "
+                f"'{anki_card_maker.ANKI_DECK_NAME}' 덱"
+            )
+        except Exception:
+            self.active_profile = None
+            self.profile_label.setText("⚠️ Anki에 연결되지 않음 (Anki 실행 후 카드를 생성하세요)")
+
     def start_generation(self):
+        self._update_profile_label()
         raw_input = self.input_field.text().strip()
         if not raw_input:
             QMessageBox.warning(self, "Warning", "단어를 입력해주세요.")
@@ -191,13 +222,21 @@ class MainWindow(QMainWindow):
         # Worker Thread
         self.worker = GenerationWorker(topics, children_mode=self.children_mode_checkbox.isChecked())
         self.worker.progress.connect(self.update_progress)
+        self.worker.fallback.connect(self.handle_fallback)
         self.worker.finished.connect(self.handle_results)
         self.worker.error.connect(self.handle_error)
         self.worker.start()
 
     def update_progress(self, current, total, text):
+        # 폴백 중 불확정 상태로 바뀌었을 수 있으므로 범위를 복구
+        self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(current)
         self.status_label.setText(text)
+
+    def handle_fallback(self, reason):
+        # Gemini가 막혔을 때. CLI는 느리므로 진행 표시를 불확정 상태로 바꾼다.
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText(f"⚠️ {reason} → Claude CLI로 생성 중... (수십 초 걸릴 수 있습니다)")
 
     def handle_results(self, cards_data):
         self.progress_bar.setVisible(False)
@@ -205,11 +244,16 @@ class MainWindow(QMainWindow):
         
         count = len(cards_data)
         added_count = 0
-        
+
+        try:
+            profile_name = anki_card_maker.get_active_profile()
+        except Exception:
+            profile_name = None
+
         try:
             for i, card_data in enumerate(cards_data):
                 self.btn_generate.setText(f"검토 중... ({i + 1}/{count})")
-                res_win = ResultWindow(card_data, self)
+                res_win = ResultWindow(card_data, profile_name, self)
                 res_win.setStyleSheet(get_styles(self.children_mode_checkbox.isChecked()))
                 if res_win.exec():
                     added_count += 1
@@ -224,7 +268,13 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.status_label.setVisible(False)
         
-        if "Gemini API 사용 한도" in error_msg:
+        if "Claude CLI 폴백도 실패" in error_msg:
+            QMessageBox.critical(self, "생성 실패 (Gemini + Claude CLI)",
+                              "Gemini와 Claude CLI 폴백이 모두 실패했습니다.\n\n"
+                              f"{error_msg}\n\n"
+                              "→ Gemini 한도라면 잠시(약 1분) 후 재시도,\n"
+                              "→ Claude CLI는 터미널에서 `claude` 로그인 상태를 확인하세요.")
+        elif "Gemini API 사용 한도" in error_msg:
             QMessageBox.warning(self, "Gemini 사용 한도 초과",
                               "Gemini API의 무료 티어 사용량 제한(Rate Limit)에 도달했습니다.\n"
                               "잠시(약 1분) 후 다시 시도해주세요.")
@@ -240,9 +290,11 @@ class MainWindow(QMainWindow):
         self.btn_generate.setText("카드 생성하기")
         self.input_field.setEnabled(True)
         self._update_counter_label()
+        self._update_profile_label()
 
 class GenerationWorker(QThread):
     progress = Signal(int, int, str)
+    fallback = Signal(str)
     finished = Signal(list)
     error = Signal(str)
 
@@ -256,6 +308,9 @@ class GenerationWorker(QThread):
             # Check Anki connection first
             import anki_card_maker
             anki_card_maker.anki_request("version")
+
+            # Gemini 실패 시 Claude CLI 폴백 사실을 UI로 전달
+            anki_card_maker.on_fallback = self.fallback.emit
 
             all_cards = []
             # Split into batches of 3 for better progress feedback
@@ -278,9 +333,12 @@ class GenerationWorker(QThread):
             
             self.progress.emit(total_count, total_count, "생성 완료!")
             self.finished.emit(all_cards)
-            
+
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            import anki_card_maker
+            anki_card_maker.on_fallback = None
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
