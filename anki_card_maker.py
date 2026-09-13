@@ -569,6 +569,28 @@ def store_media_image(data: bytes, ext: str = "jpg") -> str:
     return stored or filename
 
 
+def find_notes(query: str) -> list:
+    """Anki 검색식으로 노트 ID 목록을 가져온다"""
+    return anki_request("findNotes", query=query) or []
+
+
+def notes_info(note_ids: list) -> list:
+    """노트 ID 목록의 필드 내용을 가져온다"""
+    if not note_ids:
+        return []
+    return anki_request("notesInfo", notes=list(note_ids)) or []
+
+
+def update_note_fields(note_id: int, fields: dict):
+    """기존 노트의 필드를 수정한다"""
+    try:
+        anki_request("updateNoteFields", note={"id": note_id, "fields": fields})
+    except AnkiError as e:
+        # anki_request는 오류 문구에 duplicate/empty가 있으면 노트 '추가' 관련
+        # 예외로 바꾼다. 여기서는 수정 실패이므로 오해가 없도록 다시 감싼다.
+        raise AnkiError(f"노트(id={note_id})를 수정하지 못했습니다: {e}") from e
+
+
 def picture_html(filename: str) -> str:
     """
     Picture 필드에 넣을 HTML.

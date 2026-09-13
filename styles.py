@@ -158,6 +158,12 @@ QScrollArea {{
     background-color: transparent;
 }}
 
+/* 스크롤 안쪽 위젯은 기본 팔레트(흰색)를 쓴다.
+   글자색이 밝은 색이라 그대로 두면 흰 바탕에 흰 글씨가 된다. */
+QScrollArea > QWidget > QWidget {{
+    background-color: {COLOR_BG};
+}}
+
 QScrollBar:vertical {{
     border: none;
     background: {COLOR_BG};
