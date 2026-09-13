@@ -364,7 +364,10 @@ class PictureInputMixin:
             QMessageBox.information(self, "검색", "검색할 단어가 없습니다.")
             return
 
-        url = f"https://www.google.com/search?tbm=isch&q={quote_plus(word)}"
+        # udm=2 가 지금 구글의 이미지 탭 파라미터다.
+        # 예전 tbm=isch 로 보내면 구글이 udm=2 로 리다이렉트하면서
+        # tbs(유형 필터)를 떨어뜨려 사진/일러스트 선택이 먹히지 않는다.
+        url = f"https://www.google.com/search?udm=2&q={quote_plus(word)}"
         tbs = self.search_kind_combo.currentData()
         if tbs:
             url += f"&tbs={quote_plus(tbs, safe=':,')}"

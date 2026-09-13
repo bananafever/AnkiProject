@@ -1,3 +1,4 @@
+import re
 import sys
 
 from PySide6.QtWidgets import (
@@ -10,7 +11,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 import anki_card_maker
 import api_counter
 from picture_input import PictureInputMixin
-from styles import get_styles
+from styles import get_styles, get_colors
 
 RECOMMENDED_MAX_TOPICS = 10
 
@@ -144,6 +145,54 @@ class ResultWindow(PictureInputMixin, QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Anki 추가 중 오류 발생: {e}")
 
+def _strip_tags(html: str) -> str:
+    return re.sub(r"<[^>]+>", " ", html or "")
+
+
+def extract_pos(kr_definition: str) -> str:
+    """
+    KR_Definition에서 품사를 뽑는다. 예: "① [형용사] 각각의" -> "형용사"
+
+    6000장 넘는 노트의 형식이 제각각이라([타동사], (부), [형용사/부사] 등)
+    못 뽑는 경우를 정상으로 취급하고 빈 문자열을 돌려준다.
+    """
+    text = _strip_tags(kr_definition)
+
+    found = re.findall(r"\[([^\]]+)\]", text)
+    if not found:
+        # 오래된 노트는 ① (부) 부지런히 형식이다.
+        # 길이를 제한하는 건 일반 괄호 설명을 품사로 오인하지 않기 위해서다.
+        found = [m for m in re.findall(r"\(([^)]+)\)", text) if len(m.strip()) <= 6]
+
+    seen, result = set(), []
+    for item in found:
+        item = item.strip()
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return " · ".join(result)
+
+
+def highlight_word(html: str, word: str, bg: str, fg: str) -> str:
+    """
+    본문에 나오는 단어를 표시한다.
+
+    필드가 HTML이므로 단순 치환은 태그 속성 안까지 바꿔 마크업을 깨뜨린다.
+    태그와 텍스트를 나눠 텍스트 조각에서만 치환한다.
+    """
+    if not html or not word:
+        return html or ""
+
+    pattern = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
+    mark = f'<span style="background-color:{bg}; color:{fg};">\\g<0></span>'
+
+    # 홀수 인덱스가 태그 -- 건드리지 않는다
+    parts = re.split(r"(<[^>]+>)", html)
+    for i in range(0, len(parts), 2):
+        parts[i] = pattern.sub(mark, parts[i])
+    return "".join(parts)
+
+
 class PictureFillWindow(PictureInputMixin, QDialog):
     """이미 Anki에 있는 카드에 이미지를 채워 넣는 창"""
 
@@ -154,15 +203,19 @@ class PictureFillWindow(PictureInputMixin, QDialog):
         ("Outline", "Outline"),
     ]
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, children_mode: bool = False):
         super().__init__(parent)
         self.setWindowTitle("기존 카드에 이미지 추가")
         self.resize(640, 800)
+
+        # 하이라이트 span 색은 스타일시트에서 못 읽으므로 직접 가져온다
+        self.colors = get_colors(children_mode)
 
         self.note_ids = []      # 이미지 없는 노트 (최신순)
         self.index = 0
         self.note = None        # 현재 노트의 notesInfo 결과
         self.profile_name = None
+        self.saved_count = 0    # 이번에 채운 장수
 
         self._init_picture()
         self.init_ui()
@@ -198,10 +251,28 @@ class PictureFillWindow(PictureInputMixin, QDialog):
         self.progress_label.setObjectName("infoLabel")
         layout.addWidget(self.progress_label)
 
+        # 지금 어떤 단어의 이미지를 고르는 중인지 바로 보이게
+        banner = QWidget()
+        banner.setObjectName("wordBanner")
+        # 맨 QWidget은 스타일시트 배경을 칠하지 않는다.
+        # 이걸 켜야 배경과 왼쪽 강조선이 보인다.
+        banner.setAttribute(Qt.WA_StyledBackground, True)
+
+        banner_layout = QHBoxLayout(banner)
+        banner_layout.setContentsMargins(14, 10, 14, 10)
+        banner_layout.setSpacing(12)
+
         self.word_label = QLabel()
-        self.word_label.setObjectName("titleLabel")
+        self.word_label.setObjectName("wordText")
         self.word_label.setWordWrap(True)
-        layout.addWidget(self.word_label)
+        banner_layout.addWidget(self.word_label)
+
+        self.pos_label = QLabel()
+        self.pos_label.setObjectName("infoLabel")
+        self.pos_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        banner_layout.addWidget(self.pos_label, 1)
+
+        layout.addWidget(banner)
 
         # 필드에 HTML이 들어 있으므로 리치 텍스트로 렌더링한다
         scroll = QScrollArea()
@@ -266,6 +337,7 @@ class PictureFillWindow(PictureInputMixin, QDialog):
     def _show_empty(self, message: str):
         self.note = None
         self.word_label.setText(message)
+        self.pos_label.setText("")
         self.progress_label.setText("")
         for label in self.field_labels.values():
             label.setText("")
@@ -294,11 +366,23 @@ class PictureFillWindow(PictureInputMixin, QDialog):
         self.note = info[0]
         fields = self.note["fields"]
         self.word_label.setText(fields.get("Word/Phrase", {}).get("value", ""))
+        # '몇 번째'는 건너뛴 횟수일 뿐 진행도가 아니라서 쓰지 않는다.
+        # 큐에 남은 장수와 이번에 채운 장수를 따로 보여준다.
+        done = f"  ·  이번에 {self.saved_count}장 채움" if self.saved_count else ""
         self.progress_label.setText(
-            f"남은 {len(self.note_ids)}장 중 {self.index + 1}번째  ·  note id {note_id}"
+            f"이미지 없는 카드 {len(self.note_ids)}장{done}  ·  note id {note_id}"
         )
+        kr = fields.get("KR_Definition", {}).get("value", "")
+        pos = extract_pos(kr)
+        self.pos_label.setText(pos)
+        self.pos_label.setVisible(bool(pos))   # 못 뽑으면 빈 칸을 남기지 않는다
+
+        word = self.word_label.text()
         for key, label in self.field_labels.items():
-            label.setText(fields.get(key, {}).get("value", ""))
+            label.setText(highlight_word(
+                fields.get(key, {}).get("value", ""),
+                word, self.colors["PRIMARY"], self.colors["BG"],
+            ))
 
         # 검색으로 찾아온 카드는 이미 이미지가 있을 수 있다
         self.clear_picture()
@@ -349,6 +433,7 @@ class PictureFillWindow(PictureInputMixin, QDialog):
             return
 
         # 채운 카드는 큐에서 빼고 같은 자리의 다음 카드를 보여준다
+        self.saved_count += 1
         self.note_ids.pop(self.index)
         self.show_current()
 
@@ -465,8 +550,9 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
     def open_picture_fill(self):
-        window = PictureFillWindow(self)
-        window.setStyleSheet(get_styles(self.children_mode_checkbox.isChecked()))
+        children_mode = self.children_mode_checkbox.isChecked()
+        window = PictureFillWindow(self, children_mode=children_mode)
+        window.setStyleSheet(get_styles(children_mode))
         window.exec()
 
     def _on_mode_changed(self):

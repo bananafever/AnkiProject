@@ -5,21 +5,39 @@ from paths import resource_path
 # QSS의 url()은 정방향 슬래시만 받는다
 _CHECKMARK_PATH = resource_path("checkmark.svg").replace("\\", "/")
 
-def get_styles(children_mode: bool = False) -> str:
+def get_colors(children_mode: bool = False) -> dict:
+    """
+    팔레트를 코드에서도 쓸 수 있게 꺼낸다.
+    QSS 안의 색은 파이썬에서 읽을 수 없는데, 본문 하이라이트처럼
+    HTML을 직접 만들어야 하는 곳에서는 같은 색이 필요하다.
+    """
     if children_mode:
-        COLOR_PRIMARY = "#5B8FA8"
-        COLOR_PRIMARY_HOVER = "#7AAFC8"
-        COLOR_PRIMARY_PRESSED = "#4A7A90"
+        primary, hover, pressed = "#5B8FA8", "#7AAFC8", "#4A7A90"
     else:
-        COLOR_PRIMARY = "#8A9A5B"
-        COLOR_PRIMARY_HOVER = "#A9BA7D"
-        COLOR_PRIMARY_PRESSED = "#74824A"
+        primary, hover, pressed = "#8A9A5B", "#A9BA7D", "#74824A"
 
-    COLOR_BG = "#1C201A"
-    COLOR_SURFACE = "#262B22"
-    COLOR_TEXT = "#E1E8D8"
-    COLOR_TEXT_DIM = "#94A18E"
-    COLOR_BORDER = "#3E4738"
+    return {
+        "PRIMARY": primary,
+        "PRIMARY_HOVER": hover,
+        "PRIMARY_PRESSED": pressed,
+        "BG": "#1C201A",
+        "SURFACE": "#262B22",
+        "TEXT": "#E1E8D8",
+        "TEXT_DIM": "#94A18E",
+        "BORDER": "#3E4738",
+    }
+
+
+def get_styles(children_mode: bool = False) -> str:
+    c = get_colors(children_mode)
+    COLOR_PRIMARY = c["PRIMARY"]
+    COLOR_PRIMARY_HOVER = c["PRIMARY_HOVER"]
+    COLOR_PRIMARY_PRESSED = c["PRIMARY_PRESSED"]
+    COLOR_BG = c["BG"]
+    COLOR_SURFACE = c["SURFACE"]
+    COLOR_TEXT = c["TEXT"]
+    COLOR_TEXT_DIM = c["TEXT_DIM"]
+    COLOR_BORDER = c["BORDER"]
 
     return f"""
 QMainWindow, QDialog {{
@@ -88,6 +106,19 @@ QLabel#titleLabel {{
 QLabel#infoLabel {{
     color: {COLOR_TEXT_DIM};
     font-size: 13px;
+}}
+
+/* 지금 어떤 단어의 이미지를 고르는 중인지 바로 보이게 */
+QWidget#wordBanner {{
+    background-color: {COLOR_SURFACE};
+    border-left: 4px solid {COLOR_PRIMARY};
+    border-radius: 0;
+}}
+
+QLabel#wordText {{
+    font-size: 26px;
+    font-weight: bold;
+    color: {COLOR_TEXT};
 }}
 
 QLabel#picturePreview {{
