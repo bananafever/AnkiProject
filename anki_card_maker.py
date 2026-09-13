@@ -31,11 +31,29 @@ import api_counter
 client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_ID = "gemini-2.5-flash-lite"  # Flash-Lite 모델 적용
 
-# ── Claude CLI 폴백 설정 ───────────────────────────────────────
+# ── 생성 경로(백엔드) 설정 ──────────────────────────────────────
+BACKEND_AUTO = "auto"      # Gemini API → 실패 시 Claude CLI (기본)
+BACKEND_GEMINI = "gemini"  # Gemini API만 (폴백 없음)
+BACKEND_CLAUDE = "claude"  # Claude CLI만
+
+# UI 표시 순서 = 이 순서. 첫 항목이 기본값이다.
+BACKENDS = [
+    (BACKEND_AUTO,   "Gemini API → Claude CLI (기본)"),
+    (BACKEND_GEMINI, "Gemini API만"),
+    (BACKEND_CLAUDE, "Claude CLI만"),
+]
+
+backend = BACKEND_AUTO  # 현재 선택된 생성 경로
+
+# ── Claude CLI 설정 ────────────────────────────────────────────
 CLAUDE_CLI_TIMEOUT = 180  # 초. CLI는 API보다 느리므로 넉넉하게
 
 # 폴백이 일어날 때 호출되는 콜백 (GUI에서 상태 표시용). 인자: 사유 문자열
 on_fallback = None
+
+# 한도 초과가 확인된 카운터 기간. 여기 값이 현재 기간과 같으면 Gemini를 건너뛴다.
+# (한 번 한도가 차면 매 호출마다 429를 다시 맞을 이유가 없다)
+_gemini_blocked_period = None
 
 
 # ── 0. LLM 호출 (Gemini → Claude CLI 폴백) ──────────────────────
@@ -111,28 +129,74 @@ def _call_claude_cli(prompt: str) -> str:
     return text
 
 
-def _generate_text(prompt: str) -> str:
-    """Gemini로 먼저 시도하고, 실패하면 Claude CLI로 폴백."""
-    try:
-        return _call_gemini(prompt)
-    except Exception as e:
-        error_str = str(e).lower()
-        if "429" in error_str or "quota" in error_str or "resource_exhausted" in error_str:
-            reason = "Gemini 사용 한도 초과"
-        elif "503" in error_str or "unavailable" in error_str:
-            reason = "Gemini 서버 일시 장애"
-        else:
-            reason = f"Gemini 오류 ({type(e).__name__})"
+def _is_quota_error(error_str: str) -> bool:
+    return ("429" in error_str or "quota" in error_str
+            or "resource_exhausted" in error_str)
 
-        _notify_fallback(reason)
+
+def _gemini_error_message(e: Exception) -> str:
+    """폴백 없이 Gemini만 쓸 때 사용자에게 보여줄 메시지"""
+    error_str = str(e).lower()
+    if _is_quota_error(error_str):
+        return ("Gemini API 사용 한도(Quota)를 초과했습니다. "
+                "잠시 후 다시 시도하거나, 생성 모델을 'Claude CLI'로 바꿔주세요.")
+    if "503" in error_str or "unavailable" in error_str:
+        return ("현재 Gemini API 서버에 트래픽이 몰려 일시적으로 사용할 수 없거나 "
+                "지연되고 있습니다 (503 Unavailable). 잠시 후 다시 시도해주세요.")
+    return str(e)
+
+
+def _gemini_is_blocked() -> bool:
+    """
+    Gemini 한도 초과 상태인지 확인.
+    카운터의 일일 리셋(KST 17시)이 지나면 자동으로 해제된다.
+    """
+    if _gemini_blocked_period is None:
+        return False
+    return _gemini_blocked_period == api_counter.load_usage()["period_start"]
+
+
+def _generate_text(prompt: str) -> str:
+    """선택된 백엔드로 생성. BACKEND_AUTO면 Gemini 실패 시 Claude CLI로 폴백."""
+    global _gemini_blocked_period
+
+    if backend == BACKEND_CLAUDE:
+        return _call_claude_cli(prompt)
+
+    gemini_error = None
+
+    if backend == BACKEND_AUTO and _gemini_is_blocked():
+        # 이미 한도가 찬 것이 확인됨 → Gemini를 건너뛰고 바로 폴백
+        reason = "Gemini 사용 한도 초과 (리셋 전까지 Claude CLI 사용)"
+    else:
         try:
-            return _call_claude_cli(prompt)
-        except Exception as cli_error:
-            raise RuntimeError(
-                f"{reason}로 Gemini 생성에 실패했고, Claude CLI 폴백도 실패했습니다.\n"
-                f"→ Gemini: {e}\n"
-                f"→ Claude CLI: {cli_error}"
-            ) from cli_error
+            return _call_gemini(prompt)
+        except Exception as e:
+            gemini_error = e
+            error_str = str(e).lower()
+            if _is_quota_error(error_str):
+                # 이번 기간 내내 폴백을 쓰도록 기록
+                _gemini_blocked_period = api_counter.load_usage()["period_start"]
+                reason = "Gemini 사용 한도 초과"
+            elif "503" in error_str or "unavailable" in error_str:
+                # 일시적 장애이므로 다음 호출에서는 다시 Gemini를 시도한다
+                reason = "Gemini 서버 일시 장애"
+            else:
+                reason = f"Gemini 오류 ({type(e).__name__})"
+
+            if backend == BACKEND_GEMINI:
+                # 폴백 없이 Gemini만 쓰도록 선택한 경우
+                raise RuntimeError(_gemini_error_message(e)) from e
+
+    _notify_fallback(reason)
+    try:
+        return _call_claude_cli(prompt)
+    except Exception as cli_error:
+        detail = f"→ Gemini: {gemini_error}\n" if gemini_error is not None else ""
+        raise RuntimeError(
+            f"Claude CLI 폴백도 실패했습니다. (폴백 사유: {reason})\n"
+            f"{detail}→ Claude CLI: {cli_error}"
+        ) from cli_error
 
 
 def _extract_json(text: str) -> str:

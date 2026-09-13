@@ -2,7 +2,7 @@ import sys
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QLabel, QTextEdit, QMessageBox, QDialog,
-    QScrollArea, QCheckBox
+    QScrollArea, QCheckBox, QComboBox
 )
 import anki_card_maker
 import api_counter
@@ -132,7 +132,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        subtitle = QLabel("Gemini AI를 이용한 영어 단어장 자동 생성\n여러 단어는 쉼표로 구분하세요 (예: apple, run away, on purpose)\n안정적인 생성을 위해 한 번에 최대 10개를 권장합니다.")
+        subtitle = QLabel("AI로 영어 단어장 자동 생성\n여러 단어는 쉼표로 구분하세요 (예: apple, run away, on purpose)\n안정적인 생성을 위해 한 번에 최대 10개를 권장합니다.")
         subtitle.setObjectName("infoLabel")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
@@ -148,6 +148,20 @@ class MainWindow(QMainWindow):
         self.profile_label.setAlignment(Qt.AlignCenter)
         self._update_profile_label()
         layout.addWidget(self.profile_label)
+
+        backend_row = QHBoxLayout()
+        backend_label = QLabel("생성 모델")
+        backend_label.setObjectName("fieldLabel")
+        backend_row.addWidget(backend_label)
+
+        self.backend_combo = QComboBox()
+        for key, label in anki_card_maker.BACKENDS:
+            self.backend_combo.addItem(label, key)
+        self.backend_combo.setToolTip(
+            "Gemini API → Claude CLI: Gemini를 먼저 쓰고, 한도 초과 등으로 실패하면 Claude CLI로 자동 전환합니다."
+        )
+        backend_row.addWidget(self.backend_combo, 1)
+        layout.addLayout(backend_row)
 
         self.children_mode_checkbox = QCheckBox("어린이용 모드")
         self.children_mode_checkbox.setToolTip("외설/성적 표현/욕설 관련 내용을 제거합니다.")
@@ -185,7 +199,7 @@ class MainWindow(QMainWindow):
         count = api_counter.get_count()
         limit = api_counter.DAILY_LIMIT
         next_reset = api_counter.get_next_reset_str()
-        self.counter_label.setText(f"오늘 API 사용: {count} / {limit}  (리셋: {next_reset} KST)")
+        self.counter_label.setText(f"오늘 Gemini 사용: {count} / {limit}  (리셋: {next_reset} KST)")
 
     def _update_profile_label(self):
         try:
@@ -213,6 +227,7 @@ class MainWindow(QMainWindow):
         # UI State - Generation Start
         self.btn_generate.setEnabled(False)
         self.input_field.setEnabled(False)
+        self.backend_combo.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, len(topics))
         self.progress_bar.setValue(0)
@@ -220,7 +235,11 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"준비 중... (0/{len(topics)})")
 
         # Worker Thread
-        self.worker = GenerationWorker(topics, children_mode=self.children_mode_checkbox.isChecked())
+        self.worker = GenerationWorker(
+            topics,
+            children_mode=self.children_mode_checkbox.isChecked(),
+            backend=self.backend_combo.currentData(),
+        )
         self.worker.progress.connect(self.update_progress)
         self.worker.fallback.connect(self.handle_fallback)
         self.worker.finished.connect(self.handle_results)
@@ -276,8 +295,9 @@ class MainWindow(QMainWindow):
                               "→ Claude CLI는 터미널에서 `claude` 로그인 상태를 확인하세요.")
         elif "Gemini API 사용 한도" in error_msg:
             QMessageBox.warning(self, "Gemini 사용 한도 초과",
-                              "Gemini API의 무료 티어 사용량 제한(Rate Limit)에 도달했습니다.\n"
-                              "잠시(약 1분) 후 다시 시도해주세요.")
+                              "Gemini API의 무료 티어 사용량 제한(Rate Limit)에 도달했습니다.\n\n"
+                              "→ 잠시(약 1분) 후 다시 시도하거나,\n"
+                              "→ '생성 모델'을 'Gemini API → Claude CLI' 또는 'Claude CLI만'으로 바꿔주세요.")
         elif "Anki" in error_msg:
             QMessageBox.critical(self, "Anki Connection Error", error_msg)
         else:
@@ -289,6 +309,7 @@ class MainWindow(QMainWindow):
         self.btn_generate.setEnabled(True)
         self.btn_generate.setText("카드 생성하기")
         self.input_field.setEnabled(True)
+        self.backend_combo.setEnabled(True)
         self._update_counter_label()
         self._update_profile_label()
 
@@ -298,10 +319,11 @@ class GenerationWorker(QThread):
     finished = Signal(list)
     error = Signal(str)
 
-    def __init__(self, topics, children_mode: bool = False):
+    def __init__(self, topics, children_mode: bool = False, backend: str = None):
         super().__init__()
         self.topics = topics
         self.children_mode = children_mode
+        self.backend = backend or anki_card_maker.BACKEND_AUTO
 
     def run(self):
         try:
@@ -309,6 +331,7 @@ class GenerationWorker(QThread):
             import anki_card_maker
             anki_card_maker.anki_request("version")
 
+            anki_card_maker.backend = self.backend
             # Gemini 실패 시 Claude CLI 폴백 사실을 UI로 전달
             anki_card_maker.on_fallback = self.fallback.emit
 

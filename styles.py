@@ -95,6 +95,35 @@ QLabel#fieldLabel {{
     font-size: 14px;
 }}
 
+QComboBox {{
+    background-color: {COLOR_SURFACE};
+    border: 2px solid {COLOR_BORDER};
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 14px;
+    color: {COLOR_TEXT};
+}}
+
+QComboBox:hover {{
+    border: 2px solid {COLOR_PRIMARY};
+}}
+
+QComboBox:disabled {{
+    color: #6B7568;
+    border-color: #333B2E;
+}}
+
+QComboBox QAbstractItemView {{
+    background-color: {COLOR_SURFACE};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 6px;
+    color: {COLOR_TEXT};
+    selection-background-color: {COLOR_PRIMARY};
+    selection-color: {COLOR_BG};
+    outline: none;
+    padding: 4px;
+}}
+
 QCheckBox {{
     color: {COLOR_TEXT};
     font-size: 13px;
