@@ -10,6 +10,8 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import QProgressBar
 from styles import get_styles
 
+RECOMMENDED_MAX_TOPICS = 10
+
 class ResultWindow(QDialog):
     def __init__(self, card_data, profile_name=None, parent=None):
         super().__init__(parent)
@@ -101,7 +103,24 @@ class ResultWindow(QDialog):
             anki_card_maker.ensure_deck_exists(anki_card_maker.ANKI_DECK_NAME)
             anki_card_maker.ensure_model_exists(anki_card_maker.ANKI_MODEL_NAME)
 
-            note_id = anki_card_maker.add_note(anki_fields)
+            word = updated_fields["Word/Phrase"].strip()
+            try:
+                note_id = anki_card_maker.add_note(anki_fields)
+            except anki_card_maker.AnkiDuplicateError:
+                # 중복이라고 창을 붙잡아 두면 건너뛸 방법이 없다. 선택지를 준다.
+                answer = QMessageBox.question(
+                    self, "이미 있는 단어",
+                    f"'{word}' 노트가 이미 있습니다.\n\n"
+                    "(덱 위치와 무관하게 같은 노트 유형 전체에서 검사합니다)\n\n"
+                    "그래도 추가할까요?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    self.reject()   # 건너뛰고 다음 카드로
+                    return
+                note_id = anki_card_maker.add_note(anki_fields, allow_duplicate=True)
+
             target = self.profile_name or anki_card_maker.get_active_profile()
             QMessageBox.information(
                 self, "Success",
@@ -110,6 +129,8 @@ class ResultWindow(QDialog):
                 f"노트 ID: {note_id}"
             )
             self.accept()
+        except anki_card_maker.CardMakerError as e:
+            QMessageBox.critical(self, "Anki 추가 실패", str(e))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Anki 추가 중 오류 발생: {e}")
 
@@ -224,6 +245,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "단어를 입력해주세요.")
             return
 
+        # 권장치를 넘으면 확인만 받는다 (막지는 않는다)
+        if len(topics) > RECOMMENDED_MAX_TOPICS:
+            answer = QMessageBox.question(
+                self, "단어가 많습니다",
+                f"{len(topics)}개를 한 번에 생성하려고 합니다.\n"
+                f"권장은 {RECOMMENDED_MAX_TOPICS}개까지입니다. 시간이 오래 걸리고 "
+                "사용량도 많이 듭니다.\n\n계속할까요?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
         # UI State - Generation Start
         self.btn_generate.setEnabled(False)
         self.input_field.setEnabled(False)
@@ -295,26 +329,31 @@ class MainWindow(QMainWindow):
         finally:
             self.finalize_generation()
 
-    def handle_error(self, error_msg):
+    def handle_error(self, error):
         self.progress_bar.setVisible(False)
         self.status_label.setVisible(False)
-        
-        if "Claude CLI 폴백도 실패" in error_msg:
-            QMessageBox.critical(self, "생성 실패 (Gemini + Claude CLI)",
-                              "Gemini와 Claude CLI 폴백이 모두 실패했습니다.\n\n"
-                              f"{error_msg}\n\n"
-                              "→ Gemini 한도라면 잠시(약 1분) 후 재시도,\n"
-                              "→ Claude CLI는 터미널에서 `claude` 로그인 상태를 확인하세요.")
-        elif "Gemini API 사용 한도" in error_msg:
+
+        acm = anki_card_maker
+        message = str(error)
+
+        # 한국어 부분 문자열 대신 예외 타입으로 분기한다.
+        # 문구를 바꿔도 분기가 깨지지 않는다.
+        if isinstance(error, acm.GeminiQuotaError):
             QMessageBox.warning(self, "Gemini 사용 한도 초과",
-                              "Gemini API의 무료 티어 사용량 제한(Rate Limit)에 도달했습니다.\n\n"
-                              "→ 잠시(약 1분) 후 다시 시도하거나,\n"
-                              "→ '생성 모델'을 'Gemini API → Claude CLI' 또는 'Claude CLI만'으로 바꿔주세요.")
-        elif "Anki" in error_msg:
-            QMessageBox.critical(self, "Anki Connection Error", error_msg)
+                                f"{message}\n\n"
+                                "→ 잠시 후 다시 시도하거나,\n"
+                                "→ '생성 모델'을 'Gemini API → Claude CLI' 또는 'Claude CLI만'으로 바꿔주세요.")
+        elif isinstance(error, acm.AnkiConnectionError):
+            QMessageBox.critical(self, "Anki 연결 오류", message)
+        elif isinstance(error, acm.AnkiError):
+            QMessageBox.critical(self, "Anki 오류", message)
+        elif isinstance(error, acm.GenerationError):
+            QMessageBox.critical(self, "카드 생성 실패", message)
+        elif isinstance(error, acm.CardMakerError):
+            QMessageBox.critical(self, "오류", message)
         else:
-            QMessageBox.critical(self, "Error", f"오류가 발생했습니다: {error_msg}")
-        
+            QMessageBox.critical(self, "Error", f"예상치 못한 오류가 발생했습니다:\n\n{message}")
+
         self.finalize_generation()
 
     def finalize_generation(self):
@@ -329,7 +368,7 @@ class GenerationWorker(QThread):
     progress = Signal(int, int, str)
     fallback = Signal(str)
     finished = Signal(list, list)  # (생성된 카드, 실패한 [(단어, 사유)])
-    error = Signal(str)
+    error = Signal(object)  # 예외 객체 (타입으로 분기하기 위해)
 
     def __init__(self, topics, children_mode: bool = False, backend: str = None):
         super().__init__()
@@ -349,6 +388,7 @@ class GenerationWorker(QThread):
 
             all_cards = []
             failures = []
+            first_error = None
             # Split into batches of 3 for better progress feedback
             batch_size = 3
             total_count = len(self.topics)
@@ -370,17 +410,19 @@ class GenerationWorker(QThread):
                         all_cards.extend(cards)
                 except Exception as e:
                     failures.append((", ".join(batch), str(e)))
+                    first_error = first_error or e
 
             if not all_cards:
-                # 하나도 못 만들었으면 첫 실패 사유를 그대로 올려 기존 분기를 타게 한다
-                raise RuntimeError(failures[0][1] if failures
-                                   else "AI가 카드를 하나도 생성하지 못했습니다.")
+                # 하나도 못 만들었으면 첫 예외를 그대로 올려 타입 분기를 유지한다
+                raise first_error or anki_card_maker.GenerationError(
+                    "AI가 카드를 하나도 생성하지 못했습니다."
+                )
 
             self.progress.emit(total_count, total_count, "생성 완료!")
             self.finished.emit(all_cards, failures)
 
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(e)
         finally:
             import anki_card_maker
             anki_card_maker.on_fallback = None

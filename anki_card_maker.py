@@ -27,6 +27,34 @@ from google.genai import errors as genai_errors
 from config import GEMINI_API_KEY, ANKI_DECK_NAME, ANKI_MODEL_NAME, ENV_PATH
 import api_counter
 
+# ── 예외 타입 ──────────────────────────────────────────────────
+# GUI가 한국어 문구를 부분 문자열로 비교해 분기하던 것을 타입으로 대체한다.
+# 문구를 손볼 때마다 분기가 조용히 깨지는 걸 막는다.
+
+class CardMakerError(Exception):
+    """사용자에게 그대로 보여줘도 되는 오류"""
+
+
+class AnkiError(CardMakerError):
+    """AnkiConnect 요청 실패"""
+
+
+class AnkiConnectionError(AnkiError):
+    """Anki에 닿지 못함 (미실행, 애드온 없음, 응답 없음)"""
+
+
+class AnkiDuplicateError(AnkiError):
+    """같은 노트가 이미 있음"""
+
+
+class GenerationError(CardMakerError):
+    """AI가 쓸 수 있는 카드를 만들지 못함"""
+
+
+class GeminiQuotaError(CardMakerError):
+    """Gemini 사용 한도 초과"""
+
+
 # ── Gemini 설정 ────────────────────────────────────────────────
 MODEL_ID = "gemini-2.5-flash-lite"  # Flash-Lite 모델 적용
 
@@ -107,6 +135,14 @@ def _blocked_reason(response) -> str:
 
 def _call_gemini(prompt: str) -> str:
     """Gemini API 호출. 429/503은 1초, 2초 간격으로 최대 3회 시도."""
+    limit = api_counter.DAILY_LIMIT
+    if limit and api_counter.get_count() >= limit:
+        # 표시만 하고 막지 않으면 카운터가 아무 의미가 없다.
+        # DAILY_LIMIT = 0 으로 두면 무제한.
+        raise GeminiQuotaError(
+            f"오늘 Gemini 사용 한도({limit}회)를 모두 썼습니다."
+        )
+
     last_error = None
     for attempt in range(3):
         try:
@@ -174,7 +210,8 @@ def _call_claude_cli(prompt: str) -> str:
 
 def _is_quota_error(error_str: str) -> bool:
     return ("429" in error_str or "quota" in error_str
-            or "resource_exhausted" in error_str)
+            or "resource_exhausted" in error_str
+            or "사용 한도" in error_str)
 
 
 def _gemini_error_message(e: Exception) -> str:
@@ -232,14 +269,17 @@ def _generate_text(prompt: str) -> str:
 
             if backend == BACKEND_GEMINI:
                 # 폴백 없이 Gemini만 쓰도록 선택한 경우
-                raise RuntimeError(_gemini_error_message(e)) from e
+                message = _gemini_error_message(e)
+                if _is_quota_error(error_str) or isinstance(e, GeminiQuotaError):
+                    raise GeminiQuotaError(message) from e
+                raise GenerationError(message) from e
 
     _notify_fallback(reason)
     try:
         return _call_claude_cli(prompt)
     except Exception as cli_error:
         detail = f"→ Gemini: {gemini_error}\n" if gemini_error is not None else ""
-        raise RuntimeError(
+        raise GenerationError(
             f"Claude CLI 폴백도 실패했습니다. (폴백 사유: {reason})\n"
             f"{detail}→ Claude CLI: {cli_error}"
         ) from cli_error
@@ -297,6 +337,27 @@ def _extract_json(text: str) -> str:
     return text
 
 
+def _generate_json(prompt: str, parse):
+    """
+    생성 후 JSON 파싱까지. 형식이 틀리면 한 번 더 생성한다.
+    LLM이 예문 HTML에 큰따옴표를 섞어 JSON을 깨뜨리는 일이 잦은데,
+    전송 오류가 아니라서 _call_gemini의 재시도 루프로는 잡히지 않는다.
+    """
+    last_error = None
+    for attempt in range(2):
+        text = _generate_text(prompt)
+        try:
+            return parse(json.loads(_extract_json(text)))
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            if attempt == 0:
+                _notify_fallback("AI 응답 형식 오류 → 다시 생성 중")
+
+    raise GenerationError(
+        f"AI가 두 번 모두 올바른 형식으로 응답하지 않았습니다: {last_error}"
+    )
+
+
 # ── 1. Gemini로 카드 내용 생성 ──────────────────────────────────
 
 def generate_card(topic: str, children_mode: bool = False) -> dict:
@@ -348,16 +409,15 @@ def generate_card(topic: str, children_mode: bool = False) -> dict:
   "BlankSentence": "<div style='line-height:1.6;'>예문1 _____ 예문1 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 1</span><br><br>예문2 _____ 예문2 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 2</span></div>"
 }}
 """
-    text = _generate_text(prompt)
-    data = json.loads(_extract_json(text))
+    def parse(data):
+        # 1개만 요청했는데 배열로 답하는 경우가 있다
+        if isinstance(data, list):
+            if not data:
+                raise ValueError(f"AI가 '{topic}' 카드를 생성하지 못했습니다.")
+            data = data[0]
+        return _coerce_card(data, topic)
 
-    # 1개만 요청했는데 배열로 답하는 경우가 있다
-    if isinstance(data, list):
-        if not data:
-            raise ValueError(f"AI가 '{topic}' 카드를 생성하지 못했습니다.")
-        data = data[0]
-
-    return _coerce_card(data, topic)
+    return _generate_json(prompt, parse)
 
 
 def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
@@ -405,45 +465,73 @@ def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
 
 총 {len(topics)}개의 카드를 위 형식의 JSON 배열로 반환하세요.
 """
-    text = _generate_text(prompt)
-    data = json.loads(_extract_json(text))
+    def parse(data):
+        # 배열 대신 객체 1개로 답하는 경우가 있다.
+        # 검증 없이 넘기면 호출부의 list.extend()가 dict의 '키'를 담아버린다.
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            raise ValueError(
+                f"AI 응답 형식이 올바르지 않습니다: JSON 배열이 아님 ({type(data).__name__})"
+            )
+        if not data:
+            raise ValueError("AI가 카드를 하나도 생성하지 못했습니다.")
 
-    # 배열 대신 객체 1개로 답하는 경우가 있다.
-    # 검증 없이 넘기면 호출부의 list.extend()가 dict의 '키'를 담아버린다.
-    if isinstance(data, dict):
-        data = [data]
-    if not isinstance(data, list):
-        raise ValueError(
-            f"AI 응답 형식이 올바르지 않습니다: JSON 배열이 아님 ({type(data).__name__})"
-        )
-    if not data:
-        raise ValueError("AI가 카드를 하나도 생성하지 못했습니다.")
+        return [
+            _coerce_card(card, topics[i] if i < len(topics) else f"#{i + 1}")
+            for i, card in enumerate(data)
+        ]
 
-    return [
-        _coerce_card(card, topics[i] if i < len(topics) else f"#{i + 1}")
-        for i, card in enumerate(data)
-    ]
+    return _generate_json(prompt, parse)
 
 
 # ── 2. AnkiConnect로 카드 추가 ─────────────────────────────────
 ANKI_URL = "http://localhost:8765"
+# addNote는 중복 검사로 노트 유형 전체를 훑고, 동기화 중에는 Anki가 멈춰 있다.
+ANKI_TIMEOUT = 15
 
 
 def anki_request(action: str, **params):
     """AnkiConnect API를 호출하는 공통 함수"""
     payload = {"action": action, "version": 6, "params": params}
+
     try:
-        res = requests.post(ANKI_URL, json=payload, timeout=5)
+        res = requests.post(ANKI_URL, json=payload, timeout=ANKI_TIMEOUT)
         res.raise_for_status()
         result = res.json()
-        if result.get("error"):
-            raise RuntimeError(f"AnkiConnect 오류: {result['error']}")
-        return result["result"]
     except requests.exceptions.ConnectionError:
-        raise ConnectionError(
+        raise AnkiConnectionError(
             "Anki에 연결할 수 없습니다.\n"
             "→ Anki가 실행 중인지, AnkiConnect 애드온이 설치되어 있는지 확인하세요."
         )
+    except requests.exceptions.Timeout:
+        # 동기화·데이터베이스 확인·모달 창이 떠 있으면 Anki가 응답을 미룬다.
+        # ReadTimeout은 ConnectionError를 상속하지 않아 따로 잡아야 한다.
+        raise AnkiConnectionError(
+            f"Anki가 {ANKI_TIMEOUT}초 안에 응답하지 않았습니다.\n"
+            "→ 동기화나 데이터베이스 확인이 끝난 뒤, 또는 Anki에 열린 창을 닫고 다시 시도하세요."
+        )
+    except requests.exceptions.RequestException as e:
+        raise AnkiConnectionError(f"Anki 요청이 실패했습니다: {e}")
+    except ValueError:
+        raise AnkiError(
+            "Anki의 응답을 해석할 수 없습니다.\n"
+            f"→ {ANKI_URL} 를 다른 프로그램이 쓰고 있는지 확인하세요."
+        )
+
+    if not isinstance(result, dict):
+        raise AnkiError(f"Anki가 예상과 다른 형식으로 응답했습니다: {type(result).__name__}")
+
+    error = result.get("error")
+    if error:
+        lowered = str(error).lower()
+        if "duplicate" in lowered:
+            raise AnkiDuplicateError("이미 같은 단어의 노트가 있습니다.")
+        if "empty" in lowered:
+            raise AnkiError("첫 번째 필드(Word/Phrase)가 비어 있어 추가할 수 없습니다.")
+        raise AnkiError(f"AnkiConnect 오류: {error}")
+
+    return result.get("result")
 
 
 def ensure_deck_exists(deck_name: str):
@@ -463,24 +551,27 @@ def ensure_model_exists(model_name: str):
     """노트 유형이 없으면 사용 가능한 목록과 함께 명확한 오류를 발생"""
     models = anki_request("modelNames")
     if model_name not in models:
-        raise RuntimeError(
+        raise AnkiError(
             f"노트 유형 '{model_name}'을(를) 찾을 수 없습니다.\n"
             f"현재 프로필: {get_active_profile()}\n"
             f"사용 가능한 노트 유형: {', '.join(models)}"
         )
 
 
-def add_note(fields: dict) -> int:
-    """노트를 Anki에 추가하고 노트 ID를 반환 (Card 1 + Card 2 자동 생성)"""
+def add_note(fields: dict, allow_duplicate: bool = False) -> int:
+    """
+    노트를 Anki에 추가하고 노트 ID를 반환 (Card 1 + Card 2 자동 생성).
+    중복이면 AnkiDuplicateError가 난다. 사용자가 그래도 추가하겠다고 하면
+    allow_duplicate=True로 다시 호출한다.
+    """
     note = {
         "deckName": ANKI_DECK_NAME,
         "modelName": ANKI_MODEL_NAME,
         "fields": fields,
-        "options": {"allowDuplicate": False},
+        "options": {"allowDuplicate": allow_duplicate},
         "tags": ["auto-generated"],
     }
-    note_id = anki_request("addNote", note=note)
-    return note_id
+    return anki_request("addNote", note=note)
 
 
 # ── 3. 메인 실행 ───────────────────────────────────────────────
@@ -505,7 +596,7 @@ def main():
     ensure_deck_exists(ANKI_DECK_NAME)
     try:
         ensure_model_exists(ANKI_MODEL_NAME)
-    except RuntimeError as e:
+    except CardMakerError as e:
         print(f"\n❌ {e}")
         return
 
@@ -549,9 +640,7 @@ def main():
             note_id = add_note(fields)
             print(f"  ✅ 노트 추가 완료! Card 1 + Card 2 자동 생성됨 (ID: {note_id})\n")
 
-        except json.JSONDecodeError:
-            print("  ❌ Gemini 응답을 파싱하지 못했습니다. 다시 시도해주세요.\n")
-        except RuntimeError as e:
+        except CardMakerError as e:
             print(f"  ❌ {e}\n")
         except Exception as e:
             print(f"  ❌ 오류 발생: {e}\n")
