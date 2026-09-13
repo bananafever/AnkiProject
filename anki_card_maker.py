@@ -24,12 +24,32 @@ import subprocess
 import time
 from google import genai
 from google.genai import errors as genai_errors
-from config import GEMINI_API_KEY, ANKI_DECK_NAME, ANKI_MODEL_NAME
+from config import GEMINI_API_KEY, ANKI_DECK_NAME, ANKI_MODEL_NAME, ENV_PATH
 import api_counter
 
 # ── Gemini 설정 ────────────────────────────────────────────────
-client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_ID = "gemini-2.5-flash-lite"  # Flash-Lite 모델 적용
+
+_client = None
+
+
+def _get_client():
+    """
+    Gemini 클라이언트를 처음 쓸 때 만든다.
+    import 시점에 만들면 .env를 못 찾았을 때 창이 뜨기도 전에 죽고,
+    패키징된 exe(console=False)에서는 아무 메시지도 남지 않는다.
+    Claude CLI만 쓰는 경우에는 키가 없어도 앱이 동작해야 한다.
+    """
+    global _client
+    if _client is None:
+        if not GEMINI_API_KEY:
+            raise RuntimeError(
+                "GEMINI_API_KEY를 찾을 수 없습니다.\n"
+                f"→ {ENV_PATH} 파일에 GEMINI_API_KEY=... 를 넣어주세요.\n"
+                "→ 또는 '생성 모델'을 'Claude CLI만'으로 바꿔주세요."
+            )
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
 
 # ── 생성 경로(백엔드) 설정 ──────────────────────────────────────
 BACKEND_AUTO = "auto"      # Gemini API → 실패 시 Claude CLI (기본)
@@ -67,17 +87,40 @@ def _notify_fallback(reason: str):
             pass
 
 
+def _blocked_reason(response) -> str:
+    """Gemini가 응답을 내주지 않았을 때 사유를 최대한 뽑아낸다"""
+    reason = None
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            reason = getattr(candidates[0], "finish_reason", None)
+        if reason is None:
+            feedback = getattr(response, "prompt_feedback", None)
+            reason = getattr(feedback, "block_reason", None)
+    except Exception:
+        pass
+
+    detail = f" (사유: {reason})" if reason else ""
+    return (f"Gemini가 응답을 생성하지 않았습니다{detail}. "
+            "안전 필터에 걸렸을 수 있습니다.")
+
+
 def _call_gemini(prompt: str) -> str:
     """Gemini API 호출. 429/503은 1초, 2초 간격으로 최대 3회 시도."""
     last_error = None
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
+            response = _get_client().models.generate_content(
                 model=MODEL_ID,
                 contents=prompt
             )
+            # 안전 필터 등으로 차단되면 .text가 None이다.
+            # 카운터는 실제로 텍스트를 받은 뒤에만 올린다.
+            text = getattr(response, "text", None)
+            if text is None:
+                raise RuntimeError(_blocked_reason(response))
             api_counter.increment()  # 성공 시 카운터 증가
-            return response.text.strip()
+            return text.strip()
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
@@ -181,6 +224,9 @@ def _generate_text(prompt: str) -> str:
             elif "503" in error_str or "unavailable" in error_str:
                 # 일시적 장애이므로 다음 호출에서는 다시 Gemini를 시도한다
                 reason = "Gemini 서버 일시 장애"
+            elif "응답을 생성하지 않았습니다" in str(e):
+                # 안전 필터 차단. 재시도해도 같으므로 폴백이 유일한 길이다
+                reason = "Gemini 응답 차단(안전 필터)"
             else:
                 reason = f"Gemini 오류 ({type(e).__name__})"
 
@@ -197,6 +243,37 @@ def _generate_text(prompt: str) -> str:
             f"Claude CLI 폴백도 실패했습니다. (폴백 사유: {reason})\n"
             f"{detail}→ Claude CLI: {cli_error}"
         ) from cli_error
+
+
+# 카드 1장이 반드시 가져야 하는 키 (Picture/Audio는 코드에서 ""로 채운다)
+REQUIRED_CARD_KEYS = ("Word/Phrase", "Outline", "KR_Definition",
+                      "EN_Definition", "FullSentence", "BlankSentence")
+
+
+def _coerce_card(raw, topic_hint: str) -> dict:
+    """
+    LLM이 돌려준 카드 1장을 검증하고 문자열 필드로 정규화.
+    형식이 어긋나면 여기서 걸러야 GUI에서 엉뚱한 타입으로 터지지 않는다.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"AI 응답 형식이 올바르지 않습니다 ('{topic_hint}'): "
+            f"카드가 객체가 아님 ({type(raw).__name__})"
+        )
+
+    missing = [k for k in REQUIRED_CARD_KEYS if k not in raw]
+    if missing:
+        raise ValueError(
+            f"AI 응답에 필드가 빠졌습니다 ('{topic_hint}'): {', '.join(missing)}"
+        )
+
+    card = {}
+    for key in REQUIRED_CARD_KEYS:
+        value = raw[key]
+        card[key] = "" if value is None else (
+            value if isinstance(value, str) else str(value)
+        )
+    return card
 
 
 def _extract_json(text: str) -> str:
@@ -272,7 +349,15 @@ def generate_card(topic: str, children_mode: bool = False) -> dict:
 }}
 """
     text = _generate_text(prompt)
-    return json.loads(_extract_json(text))
+    data = json.loads(_extract_json(text))
+
+    # 1개만 요청했는데 배열로 답하는 경우가 있다
+    if isinstance(data, list):
+        if not data:
+            raise ValueError(f"AI가 '{topic}' 카드를 생성하지 못했습니다.")
+        data = data[0]
+
+    return _coerce_card(data, topic)
 
 
 def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
@@ -321,7 +406,23 @@ def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
 총 {len(topics)}개의 카드를 위 형식의 JSON 배열로 반환하세요.
 """
     text = _generate_text(prompt)
-    return json.loads(_extract_json(text))
+    data = json.loads(_extract_json(text))
+
+    # 배열 대신 객체 1개로 답하는 경우가 있다.
+    # 검증 없이 넘기면 호출부의 list.extend()가 dict의 '키'를 담아버린다.
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        raise ValueError(
+            f"AI 응답 형식이 올바르지 않습니다: JSON 배열이 아님 ({type(data).__name__})"
+        )
+    if not data:
+        raise ValueError("AI가 카드를 하나도 생성하지 못했습니다.")
+
+    return [
+        _coerce_card(card, topics[i] if i < len(topics) else f"#{i + 1}")
+        for i, card in enumerate(data)
+    ]
 
 
 # ── 2. AnkiConnect로 카드 추가 ─────────────────────────────────

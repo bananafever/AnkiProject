@@ -257,10 +257,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)
         self.status_label.setText(f"⚠️ {reason} → Claude CLI로 생성 중... (수십 초 걸릴 수 있습니다)")
 
-    def handle_results(self, cards_data):
+    def handle_results(self, cards_data, failures=None):
         self.progress_bar.setVisible(False)
         self.status_label.setVisible(False)
-        
+
+        failures = failures or []
         count = len(cards_data)
         added_count = 0
 
@@ -276,10 +277,21 @@ class MainWindow(QMainWindow):
                 res_win.setStyleSheet(get_styles(self.children_mode_checkbox.isChecked()))
                 if res_win.exec():
                     added_count += 1
-            
+
             if added_count > 0:
                 self.input_field.clear()
-                QMessageBox.information(self, "완료", f"{added_count}개의 카드가 Anki에 추가되었습니다.")
+
+            # 실패한 배치가 있으면 성공/실패를 함께 알린다
+            summary = f"{added_count}개의 카드가 Anki에 추가되었습니다."
+            if failures:
+                detail = "\n".join(f"  · {words}: {reason}" for words, reason in failures)
+                QMessageBox.warning(self, "일부 실패",
+                                    f"{summary}\n\n생성에 실패한 단어:\n{detail}")
+            elif added_count > 0:
+                QMessageBox.information(self, "완료", summary)
+        except Exception as e:
+            # 슬롯 밖으로 예외가 나가면 패키징된 exe가 조용히 죽는다
+            QMessageBox.critical(self, "Error", f"카드 검토 중 오류가 발생했습니다: {e}")
         finally:
             self.finalize_generation()
 
@@ -316,7 +328,7 @@ class MainWindow(QMainWindow):
 class GenerationWorker(QThread):
     progress = Signal(int, int, str)
     fallback = Signal(str)
-    finished = Signal(list)
+    finished = Signal(list, list)  # (생성된 카드, 실패한 [(단어, 사유)])
     error = Signal(str)
 
     def __init__(self, topics, children_mode: bool = False, backend: str = None):
@@ -336,26 +348,36 @@ class GenerationWorker(QThread):
             anki_card_maker.on_fallback = self.fallback.emit
 
             all_cards = []
+            failures = []
             # Split into batches of 3 for better progress feedback
             batch_size = 3
             total_count = len(self.topics)
-            
+
             for i in range(0, total_count, batch_size):
                 batch = self.topics[i:i + batch_size]
                 current_count = len(all_cards)
-                
+
                 status_text = f"생성 중... ({current_count}/{total_count})"
                 self.progress.emit(current_count, total_count, status_text)
-                
-                if len(batch) == 1:
-                    card = anki_card_maker.generate_card(batch[0], children_mode=self.children_mode)
-                    all_cards.append(card)
-                else:
-                    cards = anki_card_maker.generate_cards_batch(batch, children_mode=self.children_mode)
-                    all_cards.extend(cards)
-            
+
+                # 배치 하나가 실패해도 이미 생성한 카드는 지키고 다음 배치를 계속한다
+                try:
+                    if len(batch) == 1:
+                        card = anki_card_maker.generate_card(batch[0], children_mode=self.children_mode)
+                        all_cards.append(card)
+                    else:
+                        cards = anki_card_maker.generate_cards_batch(batch, children_mode=self.children_mode)
+                        all_cards.extend(cards)
+                except Exception as e:
+                    failures.append((", ".join(batch), str(e)))
+
+            if not all_cards:
+                # 하나도 못 만들었으면 첫 실패 사유를 그대로 올려 기존 분기를 타게 한다
+                raise RuntimeError(failures[0][1] if failures
+                                   else "AI가 카드를 하나도 생성하지 못했습니다.")
+
             self.progress.emit(total_count, total_count, "생성 완료!")
-            self.finished.emit(all_cards)
+            self.finished.emit(all_cards, failures)
 
         except Exception as e:
             self.error.emit(str(e))

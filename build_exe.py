@@ -10,10 +10,9 @@ def build_exe():
     app_name = "AnkiCardMaker"
     
     # 추가할 데이터나 파일이 있다면 여기에 작성 (예: 아이콘)
-    # 현재는 특별한 이미지 에셋이 없으므로 비워둡니다.
+    # .env는 일부러 넣지 않는다 (키를 exe에 박지 않기 위해). exe 옆에 두고 쓴다.
     datas = [
         # (source, destination)
-        # (".env", "."), # .env를 포함하고 싶다면 주석 해제 (단, 보안 주의)
     ]
     
     # PyInstaller 옵션 구성
@@ -29,10 +28,10 @@ def build_exe():
         # PySide6 관련 최적화 (필요시)
         "--collect-submodules=PySide6",
         
-        # 프로젝트 관련 모듈들 (자동으로 추적되지만 명시적으로 추가 가능)
-        "--add-data=styles.py;.",
-        "--add-data=config.py;.", 
-        "--add-data=anki_card_maker.py;.",
+        # .py 모듈은 PyInstaller가 자동으로 번들하므로 --add-data가 필요 없다.
+        # 반면 checkmark.svg는 코드가 경로로 여는 자원이라 명시해야 한다.
+        # (빠뜨리면 체크박스 체크 표시가 조용히 사라진다)
+        "--add-data=checkmark.svg;.",
     ]
     
     # .env 파일은 빌드된 exe와 같은 폴더에 있어야 작동함

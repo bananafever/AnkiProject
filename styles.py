@@ -1,8 +1,9 @@
 # Styles for Anki Card Maker
 
-import os
+from paths import resource_path
 
-_CHECKMARK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkmark.svg").replace("\\", "/")
+# QSS의 url()은 정방향 슬래시만 받는다
+_CHECKMARK_PATH = resource_path("checkmark.svg").replace("\\", "/")
 
 def get_styles(children_mode: bool = False) -> str:
     if children_mode:

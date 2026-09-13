@@ -31,6 +31,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so you don't need to check them in.
 *.manifest
 *.spec
+# 이 프로젝트의 실제 빌드 설정이므로 추적한다
+!AnkiCardMaker.spec
 
 # Installer logs
 pip-log.txt
@@ -156,3 +158,9 @@ cython_debug/
 config.py
 debug_import.py
 api_usage.json
+
+# 임시 실험 스크립트 및 그 출력물
+test.py
+test_model.py
+model_test_results.txt
+test_model_output.txt
