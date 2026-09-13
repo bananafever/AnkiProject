@@ -84,20 +84,7 @@ class ResultWindow(QDialog):
             for key, edit in self.edits.items():
                 updated_fields[key] = edit.toPlainText()
 
-            # Prepare fields for Anki (HTML conversion)
-            def to_html(text: str) -> str:
-                return text.replace("\n", "<br>")
-
-            anki_fields = {
-                "Word/Phrase":   updated_fields["Word/Phrase"],
-                "BlankSentence": updated_fields["BlankSentence"],
-                "FullSentence":  updated_fields["FullSentence"],
-                "KR_Definition": to_html(updated_fields["KR_Definition"]),
-                "EN_Definition": to_html(updated_fields["EN_Definition"]),
-                "Outline":       to_html(updated_fields["Outline"]),
-                "Picture":       "",
-                "Audio":         "",
-            }
+            anki_fields = anki_card_maker.build_anki_fields(updated_fields)
 
             # Ensure deck / note type exist
             anki_card_maker.ensure_deck_exists(anki_card_maker.ANKI_DECK_NAME)
@@ -379,7 +366,6 @@ class GenerationWorker(QThread):
     def run(self):
         try:
             # Check Anki connection first
-            import anki_card_maker
             anki_card_maker.anki_request("version")
 
             anki_card_maker.backend = self.backend
@@ -424,8 +410,8 @@ class GenerationWorker(QThread):
         except Exception as e:
             self.error.emit(e)
         finally:
-            import anki_card_maker
             anki_card_maker.on_fallback = None
+            anki_card_maker.backend = anki_card_maker.BACKEND_AUTO
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

@@ -12,7 +12,7 @@ from paths import user_data_path
 
 KST = timezone(timedelta(hours=9))
 RESET_HOUR = 17       # KST 오후 5시
-DAILY_LIMIT = 20
+DAILY_LIMIT = 0
 
 COUNTER_FILE = user_data_path("api_usage.json")
 

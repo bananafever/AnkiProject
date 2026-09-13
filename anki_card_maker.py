@@ -23,7 +23,6 @@ import shutil
 import subprocess
 import time
 from google import genai
-from google.genai import errors as genai_errors
 from config import GEMINI_API_KEY, ANKI_DECK_NAME, ANKI_MODEL_NAME, ENV_PATH
 import api_counter
 
@@ -358,85 +357,37 @@ def _generate_json(prompt: str, parse):
     )
 
 
-# ── 1. Gemini로 카드 내용 생성 ──────────────────────────────────
+# ── 1. 카드 내용 생성 ───────────────────────────────────────────
 
-def generate_card(topic: str, children_mode: bool = False) -> dict:
+CHILDREN_RULE = """
+[어린이 모드 규칙]
+- 모든 정의, 설명, 예문에서 성적 표현, 외설적 내용, 욕설을 완전히 제거한다.
+- 예문은 어린이에게 적합한 일상적/교육적 상황으로만 구성한다.
+- 성인 주제(음주, 도박, 폭력, 성인 관계 등)를 다루는 예문은 중립적 상황으로 대체한다.
+- 어린이 모드임을 언급하거나 특정 내용을 제외했음을 설명하는 문구를 절대 포함하지 않는다.
+  (예: "어린이 모드에서는 ~", "성적인 의미를 제외하고 ~" 등의 표현 금지)
+"""
+
+
+def _build_prompt(topics: list, children_mode: bool) -> str:
     """
-    단어/표현 1개로 노트에 필요한 모든 필드 생성
-    Gem 지침과 동일한 포맷으로 생성 (섹션 3, 7 제외)
+    카드 생성 프롬프트를 만든다.
+
+    단어가 1개든 여러 개든 같은 규칙을 쓴다. 예전에는 단일용/배치용 프롬프트가
+    따로 있었고 내용이 갈려서, 입력 개수에 따라 지시가 달라졌다.
+    (배치 쪽에만 '기계적인 사전 순서가 아닌'이 있었다)
 
     필드 매핑:
-      Outline        ← 섹션 1. 개요
-      KR_Definition  ← 섹션 2. 영한사전 뜻
-      EN_Definition  ← 섹션 4. 영영사전 뜻
-      FullSentence   ← 섹션 5. 예문 (HTML)
-      BlankSentence  ← 섹션 6. 빈칸 예문 (HTML)
-    """
-    children_rule = """
-[어린이 모드 규칙]
-- 모든 정의, 설명, 예문에서 성적 표현, 외설적 내용, 욕설을 완전히 제거한다.
-- 예문은 어린이에게 적합한 일상적/교육적 상황으로만 구성한다.
-- 성인 주제(음주, 도박, 폭력, 성인 관계 등)를 다루는 예문은 중립적 상황으로 대체한다.
-- 어린이 모드임을 언급하거나 특정 내용을 제외했음을 설명하는 문구를 절대 포함하지 않는다.
-  (예: "어린이 모드에서는 ~", "성적인 의미를 제외하고 ~" 등의 표현 금지)
-""" if children_mode else ""
-
-    prompt = f"""
-아래 단어/표현으로 Anki 플래시카드 내용을 만들어주세요.
-
-단어/표현: {topic}
-{children_rule}
-[작성 규칙]
-- HTML style 속성은 반드시 작은따옴표(')를 사용하세요. (JSON 파싱 오류 방지)
-- Outline에는 '사용 빈도', '사용시 유의 사항', '뉘앙스', '문맥 및 배경' 4가지를 모두 반드시 포함하여 작성하세요.
-- 뜻(KR_Definition, EN_Definition)을 작성할 때는 반드시 실제 사용 빈도가 가장 높은 뜻을 1번에 배치하고, 그 다음으로 자주 쓰이는 순서대로 나열하세요.
-- ★중요★ 품사 작성 시 단어가 동사라면 단순히 '[동사]'라고 쓰지 말고, 반드시 '[자동사]' 또는 '[타동사]' (영어는 vi. 또는 vt.)로 완벽하게 구분해서 기재하세요.
-- FullSentence와 BlankSentence는 동일한 문장을 사용하며,
-  BlankSentence는 {topic} 부분만 _____로 교체합니다.
-- 반드시 아래 JSON 형식으로만 답하세요. 다른 말 없이 JSON만 출력하세요.
-
-{{
-  "Word/Phrase": "{topic}",
-
-  "Outline": "① 사용 빈도: (높음/중간/낮음 및 한 줄 설명)\\n② 사용시 유의 사항: (문법적 특징, 자주 헷갈리는 뜻 등)\\n③ 뉘앙스: (격식체/비격식, 긍정/부정 등)\\n④ 문맥 및 배경: (주로 쓰이는 상황)",
-
-  "KR_Definition": "① [타동사] 뜻 1 (동사면 반드시 자/타 구분)\\n② [명사] 뜻 2\\n③ [형용사] 뜻 3",
-
-  "EN_Definition": "① (vt.) Definition 1\\n② (n.) Definition 2\\n③ (adj.) Definition 3",
-
-  "FullSentence": "<div style='line-height:1.6;'>예문1 <span style='color:#FFD54F'>{topic}</span> 예문1 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 1</span><br><br>예문2 <span style='color:#FFD54F'>{topic}</span> 예문2 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 2</span></div>",
-
-  "BlankSentence": "<div style='line-height:1.6;'>예문1 _____ 예문1 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 1</span><br><br>예문2 _____ 예문2 계속<br><span style='color:#A0A0A0;'>→ 한국어 번역 2</span></div>"
-}}
-"""
-    def parse(data):
-        # 1개만 요청했는데 배열로 답하는 경우가 있다
-        if isinstance(data, list):
-            if not data:
-                raise ValueError(f"AI가 '{topic}' 카드를 생성하지 못했습니다.")
-            data = data[0]
-        return _coerce_card(data, topic)
-
-    return _generate_json(prompt, parse)
-
-
-def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
-    """
-    여러 단어/표현을 한 번의 API 호출로 카드 내용 생성 (RPD 절약)
-    Returns: list of card dicts
+      Outline        ← 개요
+      KR_Definition  ← 영한사전 뜻
+      EN_Definition  ← 영영사전 뜻
+      FullSentence   ← 예문 (HTML)
+      BlankSentence  ← 빈칸 예문 (HTML)
     """
     topics_str = "\n".join(f"- {t}" for t in topics)
+    children_rule = CHILDREN_RULE if children_mode else ""
 
-    children_rule = """
-[어린이 모드 규칙]
-- 모든 정의, 설명, 예문에서 성적 표현, 외설적 내용, 욕설을 완전히 제거한다.
-- 예문은 어린이에게 적합한 일상적/교육적 상황으로만 구성한다.
-- 성인 주제(음주, 도박, 폭력, 성인 관계 등)를 다루는 예문은 중립적 상황으로 대체한다.
-- 어린이 모드임을 언급하거나 특정 내용을 제외했음을 설명하는 문구를 절대 포함하지 않는다.
-  (예: "어린이 모드에서는 ~", "성적인 의미를 제외하고 ~" 등의 표현 금지)
-""" if children_mode else ""
-
-    prompt = f"""
+    return f"""
 아래 단어/표현 목록 각각에 대해 Anki 플래시카드 내용을 만들어주세요.
 
 단어/표현 목록:
@@ -465,6 +416,12 @@ def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
 
 총 {len(topics)}개의 카드를 위 형식의 JSON 배열로 반환하세요.
 """
+
+
+def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
+    """여러 단어/표현을 한 번의 호출로 생성 (API 사용량 절약). Returns: list of card dicts"""
+    prompt = _build_prompt(topics, children_mode)
+
     def parse(data):
         # 배열 대신 객체 1개로 답하는 경우가 있다.
         # 검증 없이 넘기면 호출부의 list.extend()가 dict의 '키'를 담아버린다.
@@ -483,6 +440,12 @@ def generate_cards_batch(topics: list, children_mode: bool = False) -> list:
         ]
 
     return _generate_json(prompt, parse)
+
+
+def generate_card(topic: str, children_mode: bool = False) -> dict:
+    """단어/표현 1개로 카드 생성"""
+    cards = generate_cards_batch([topic], children_mode=children_mode)
+    return cards[0]
 
 
 # ── 2. AnkiConnect로 카드 추가 ─────────────────────────────────
@@ -558,6 +521,29 @@ def ensure_model_exists(model_name: str):
         )
 
 
+def to_html(text: str) -> str:
+    """줄바꿈을 <br>로. Anki 필드는 HTML이라 개행이 그대로 죽는다."""
+    return text.replace("\n", "<br>")
+
+
+def build_anki_fields(card: dict) -> dict:
+    """
+    카드 dict를 노트 유형의 8개 필드로 변환.
+    CLI와 GUI가 각자 들고 있던 것을 한 곳으로 모았다.
+    Picture/Audio는 Anki에서 직접 채운다.
+    """
+    return {
+        "Word/Phrase":   card.get("Word/Phrase", ""),
+        "BlankSentence": card.get("BlankSentence", ""),
+        "FullSentence":  card.get("FullSentence", ""),
+        "KR_Definition": to_html(card.get("KR_Definition", "")),
+        "EN_Definition": to_html(card.get("EN_Definition", "")),
+        "Outline":       to_html(card.get("Outline", "")),
+        "Picture":       "",
+        "Audio":         "",
+    }
+
+
 def add_note(fields: dict, allow_duplicate: bool = False) -> int:
     """
     노트를 Anki에 추가하고 노트 ID를 반환 (Card 1 + Card 2 자동 생성).
@@ -622,22 +608,7 @@ def main():
             print(f"  📝 한국어뜻:\n{card['KR_Definition']}")
             print(f"  📝 영어뜻:\n{card['EN_Definition']}")
 
-            # Anki는 HTML 렌더링이므로 \n → <br> 변환 필요
-            def to_html(text: str) -> str:
-                return text.replace("\n", "<br>")
-
-            fields = {
-                "Word/Phrase":   card["Word/Phrase"],
-                "BlankSentence": card["BlankSentence"],
-                "FullSentence":  card["FullSentence"],
-                "KR_Definition": to_html(card["KR_Definition"]),
-                "EN_Definition": to_html(card["EN_Definition"]),
-                "Outline":       to_html(card.get("Outline", "")),
-                "Picture":       "",   # 직접 추가 필요
-                "Audio":         "",   # 직접 추가 필요
-            }
-
-            note_id = add_note(fields)
+            note_id = add_note(build_anki_fields(card))
             print(f"  ✅ 노트 추가 완료! Card 1 + Card 2 자동 생성됨 (ID: {note_id})\n")
 
         except CardMakerError as e:

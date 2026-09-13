@@ -188,5 +188,3 @@ QMessageBox QLabel {{
     color: {COLOR_TEXT};
 }}
 """
-
-STYLES = get_styles()

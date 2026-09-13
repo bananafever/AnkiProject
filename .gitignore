@@ -164,3 +164,6 @@ test.py
 test_model.py
 model_test_results.txt
 test_model_output.txt
+
+# 노트 유형 백업 (개인 보관용)
+보관/
