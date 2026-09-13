@@ -1,6 +1,8 @@
+import base64
 import os
+import re
 import sys
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, parse_qs, urlparse, unquote_to_bytes
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,6 +24,18 @@ PICTURE_PREVIEW_HEIGHT = 120
 # 드롭된 URL에서 내려받을 때의 상한
 PICTURE_DOWNLOAD_TIMEOUT = 10
 MAX_PICTURE_BYTES = 10 * 1024 * 1024
+
+# 기본 python-requests UA는 이미지 호스트가 자주 막는다
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+
+def _short_url(url: str, limit: int = 45) -> str:
+    """오류 메시지에 넣을 짧은 URL 표기"""
+    return url if len(url) <= limit else url[:limit - 3] + "..."
 
 class ResultWindow(QDialog):
     def __init__(self, card_data, profile_name=None, parent=None):
@@ -178,24 +192,111 @@ class ResultWindow(QDialog):
             raise ValueError("이미지를 변환하지 못했습니다.")
         self._set_picture(bytes(buffer.data()), ext)
 
-    def _set_picture_from_mime(self, mime) -> bool:
-        """클립보드/드롭 데이터에서 이미지를 꺼낸다. 성공하면 True."""
+    def _picture_candidates(self, mime) -> list:
+        """
+        드롭/클립보드 데이터에서 시도해볼 이미지 출처를 우선순위대로 모은다.
+
+        브라우저에서 끌면 uri-list / text-html / 이미지 데이터가 함께 오고,
+        구글 이미지는 uri-list에 이미지 주소가 아니라 결과 페이지 링크
+        (imgres?imgurl=...)를 넣는다. 하나만 보고 포기하면 안 된다.
+
+        반환: [(라벨, 실행 함수), ...]
+        """
         if mime is None:
+            return []
+
+        candidates = []
+
+        # 1) 이미지 데이터가 실려 있으면 네트워크가 필요 없다
+        if mime.hasImage():
+            candidates.append(
+                ("클립보드 이미지",
+                 lambda: self._set_picture_from_image(QImage(mime.imageData())))
+            )
+
+        direct_urls = []
+        for url in mime.urls():
+            # 2) 로컬 파일
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                candidates.append((f"파일 {os.path.basename(path)}",
+                                   lambda p=path: self._load_picture_file(p)))
+                continue
+
+            text = url.toString()
+
+            # 3) data:image/...;base64,....
+            if url.scheme() == "data":
+                candidates.append(("data: URL",
+                                   lambda t=text: self._set_picture_from_data_url(t)))
+                continue
+
+            if url.scheme() not in ("http", "https"):
+                continue
+
+            query = parse_qs(urlparse(text).query)
+            # 4) 구글 이미지 결과 링크 -> imgurl 에 원본 주소가 들어 있다 (해상도 최상)
+            real = (query.get("imgurl") or query.get("mediaurl") or [None])[0]
+            if real:
+                referer = (query.get("imgrefurl") or [None])[0]
+                candidates.append((f"원본 {_short_url(real)}",
+                                   lambda u=real, r=referer: self._download_picture(u, r)))
+            else:
+                direct_urls.append(text)
+
+        # 5) 평범한 이미지 링크
+        for text in direct_urls:
+            candidates.append((f"링크 {_short_url(text)}",
+                               lambda u=text: self._download_picture(u)))
+
+        # 6) text/html 조각의 <img src> — 구글이 서빙하는 썸네일.
+        #    원본이 핫링크 차단이면 이쪽에서 건진다.
+        if mime.hasHtml():
+            found = re.search(r"""<img[^>]+src=["']([^"']+)["']""", mime.html(), re.I)
+            if found:
+                thumb = found.group(1)
+                if thumb.startswith("data:"):
+                    candidates.append(("HTML 조각의 data: 이미지",
+                                       lambda t=thumb: self._set_picture_from_data_url(t)))
+                elif not any(thumb in label for label, _ in candidates):
+                    candidates.append((f"썸네일 {_short_url(thumb)}",
+                                       lambda u=thumb: self._download_picture(u)))
+
+        return candidates
+
+    def _set_picture_from_mime(self, mime) -> bool:
+        """
+        후보를 순서대로 시도한다. 하나라도 성공하면 True.
+        전부 실패하면 무엇을 왜 못 했는지 모아서 알린다.
+        """
+        candidates = self._picture_candidates(mime)
+        if not candidates:
             return False
 
-        if mime.hasImage():
-            self._set_picture_from_image(QImage(mime.imageData()))
-            return True
-
-        for url in mime.urls():
-            if url.isLocalFile():
-                self._load_picture_file(url.toLocalFile())
+        failures = []
+        for label, attempt in candidates:
+            try:
+                attempt()
                 return True
-            if url.scheme() in ("http", "https"):
-                self._download_picture(url.toString())
-                return True
+            except Exception as e:
+                failures.append(f"  · {label}: {e}")
 
-        return False
+        raise ValueError(
+            "이미지를 가져오지 못했습니다. 시도한 출처:\n" + "\n".join(failures)
+        )
+
+    def _set_picture_from_data_url(self, text: str):
+        header, _, payload = text.partition(",")
+        if not payload:
+            raise ValueError("data: URL 형식이 아닙니다.")
+        if "base64" in header:
+            data = base64.b64decode(payload)
+        else:
+            data = unquote_to_bytes(payload)
+        if "image/gif" in header:
+            self._set_picture(data, "gif")
+            return
+        self._set_picture_from_image(QImage.fromData(QByteArray(data)))
 
     def _load_picture_file(self, path: str):
         ext = os.path.splitext(path)[1].lstrip(".").lower()
@@ -206,23 +307,30 @@ class ResultWindow(QDialog):
             return
         self._set_picture_from_image(QImage(path))
 
-    def _download_picture(self, url: str):
-        """브라우저에서 이미지를 끌어다 놓으면 URL로 온다"""
+    def _download_picture(self, url: str, referer: str = None):
+        """
+        브라우저에서 이미지를 끌어다 놓으면 URL로 온다.
+        기본 python-requests UA는 이미지 호스트가 자주 막으므로 브라우저처럼 요청한다.
+        """
         import requests
 
-        res = requests.get(url, timeout=PICTURE_DOWNLOAD_TIMEOUT, stream=True)
+        headers = dict(BROWSER_HEADERS)
+        # 핫링크 차단을 통과하려면 Referer가 필요한 경우가 많다
+        headers["Referer"] = referer or f"{urlparse(url).scheme}://{urlparse(url).netloc}/"
+
+        res = requests.get(url, headers=headers, timeout=PICTURE_DOWNLOAD_TIMEOUT, stream=True)
         res.raise_for_status()
 
-        content_type = res.headers.get("Content-Type", "")
+        content_type = res.headers.get("Content-Type", "").split(";")[0].strip()
         if not content_type.startswith("image/"):
-            raise ValueError(f"이미지가 아닙니다 (Content-Type: {content_type or '알 수 없음'})")
+            raise ValueError(f"이미지가 아님 (Content-Type: {content_type or '알 수 없음'})")
 
         data = b""
         for chunk in res.iter_content(64 * 1024):
             data += chunk
             if len(data) > MAX_PICTURE_BYTES:
                 raise ValueError(
-                    f"이미지가 너무 큽니다 ({MAX_PICTURE_BYTES // (1024 * 1024)}MB 초과)."
+                    f"이미지가 너무 큼 ({MAX_PICTURE_BYTES // (1024 * 1024)}MB 초과)"
                 )
 
         if content_type == "image/gif":
@@ -283,16 +391,31 @@ class ResultWindow(QDialog):
             QUrl(f"https://www.google.com/search?tbm=isch&q={quote_plus(word)}")
         )
 
+    def _set_picture_hint(self, text: str):
+        """다운로드 중처럼 잠깐 다른 안내를 띄울 때. 이미지가 있으면 건드리지 않는다."""
+        if not self.picture_data:
+            self.picture_preview.setText(text)
+            QApplication.processEvents()
+
     def dragEnterEvent(self, event):
         mime = event.mimeData()
-        if mime.hasImage() or mime.hasUrls():
+        if mime.hasImage() or mime.hasUrls() or mime.hasHtml():
+            self._set_picture_hint("여기에 놓으세요")
             event.acceptProposedAction()
 
+    def dragLeaveEvent(self, event):
+        self._refresh_picture_preview()
+
     def dropEvent(self, event):
+        # 내려받는 데 몇 초 걸릴 수 있어 아무 반응이 없으면 멈춘 것처럼 보인다
+        self._set_picture_hint("이미지를 가져오는 중...")
         try:
             if self._set_picture_from_mime(event.mimeData()):
                 event.acceptProposedAction()
+            else:
+                self._refresh_picture_preview()
         except Exception as e:
+            self._refresh_picture_preview()
             self._picture_error(e)
 
     # ── Anki 추가 ───────────────────────────────────────────────
