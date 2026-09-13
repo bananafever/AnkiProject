@@ -1,16 +1,27 @@
+import os
 import sys
+from urllib.parse import quote_plus
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QLabel, QTextEdit, QMessageBox, QDialog,
-    QScrollArea, QCheckBox, QComboBox
+    QScrollArea, QCheckBox, QComboBox, QFileDialog
 )
 import anki_card_maker
 import api_counter
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QBuffer, QByteArray, QUrl
+from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QKeySequence, QShortcut, QDesktopServices
 from PySide6.QtWidgets import QProgressBar
 from styles import get_styles
 
 RECOMMENDED_MAX_TOPICS = 10
+
+# 화면에는 200px 높이로만 나오므로 원본을 그대로 담을 이유가 없다
+MAX_PICTURE_EDGE = 800
+PICTURE_PREVIEW_HEIGHT = 120
+# 드롭된 URL에서 내려받을 때의 상한
+PICTURE_DOWNLOAD_TIMEOUT = 10
+MAX_PICTURE_BYTES = 10 * 1024 * 1024
 
 class ResultWindow(QDialog):
     def __init__(self, card_data, profile_name=None, parent=None):
@@ -19,7 +30,18 @@ class ResultWindow(QDialog):
         self.resize(600, 700)
         self.card_data = card_data
         self.profile_name = profile_name
+
+        # 이미지는 self.edits에 넣지 않는다 — add_to_anki의 루프가
+        # .toPlainText()를 부르므로 QTextEdit이 아닌 것이 섞이면 터진다.
+        self.picture_data = None   # bytes
+        self.picture_ext = "jpg"
+
+        self.setAcceptDrops(True)
         self.init_ui()
+
+        # 창 어디에 포커스가 있든 Ctrl+V로 이미지를 붙일 수 있게 한다.
+        # (텍스트 편집 중이면 그쪽 붙여넣기가 우선)
+        QShortcut(QKeySequence.Paste, self, activated=self.paste_picture)
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -65,6 +87,8 @@ class ResultWindow(QDialog):
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
 
+        layout.addLayout(self._build_picture_section())
+
         btn_layout = QHBoxLayout()
         self.btn_add = QPushButton("Anki에 추가")
         self.btn_add.clicked.connect(self.add_to_anki)
@@ -77,12 +101,216 @@ class ResultWindow(QDialog):
         btn_layout.addWidget(self.btn_add)
         layout.addLayout(btn_layout)
 
+    # ── 이미지 ──────────────────────────────────────────────────
+
+    def _build_picture_section(self):
+        section = QVBoxLayout()
+        section.setSpacing(8)
+
+        label = QLabel("Picture (선택)")
+        label.setObjectName("fieldLabel")
+        section.addWidget(label)
+
+        self.picture_preview = QLabel()
+        self.picture_preview.setObjectName("picturePreview")
+        self.picture_preview.setAlignment(Qt.AlignCenter)
+        self.picture_preview.setFixedHeight(PICTURE_PREVIEW_HEIGHT)
+        section.addWidget(self.picture_preview)
+
+        row = QHBoxLayout()
+        for text, slot in (
+            ("🔍 구글 이미지", self.open_image_search),
+            ("📋 붙여넣기", self.paste_picture),
+            ("파일...", self.choose_picture_file),
+            ("제거", self.clear_picture),
+        ):
+            btn = QPushButton(text)
+            btn.setObjectName("secondaryButton")
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+        section.addLayout(row)
+
+        self._refresh_picture_preview()
+        return section
+
+    def _current_word(self) -> str:
+        edit = self.edits.get("Word/Phrase")
+        if edit is not None:
+            return edit.toPlainText().strip()
+        return str(self.card_data.get("Word/Phrase", "")).strip()
+
+    def _refresh_picture_preview(self):
+        if not self.picture_data:
+            self.picture_preview.setPixmap(QPixmap())
+            self.picture_preview.setText(
+                "이미지 없음 — Ctrl+V로 붙여넣거나 여기로 끌어다 놓으세요"
+            )
+            return
+
+        pixmap = QPixmap()
+        if pixmap.loadFromData(QByteArray(self.picture_data)):
+            self.picture_preview.setText("")
+            self.picture_preview.setPixmap(pixmap.scaled(
+                self.picture_preview.width(), PICTURE_PREVIEW_HEIGHT - 8,
+                Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            ))
+        else:
+            self.picture_preview.setText("이미지를 표시할 수 없습니다")
+
+    def _set_picture(self, data: bytes, ext: str):
+        self.picture_data = data
+        self.picture_ext = ext
+        self._refresh_picture_preview()
+
+    def _set_picture_from_image(self, image: QImage):
+        """QImage를 JPEG(투명도가 있으면 PNG)로 인코딩해 보관"""
+        if image.isNull():
+            raise ValueError("이미지를 읽을 수 없습니다.")
+
+        if max(image.width(), image.height()) > MAX_PICTURE_EDGE:
+            image = image.scaled(MAX_PICTURE_EDGE, MAX_PICTURE_EDGE,
+                                 Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        fmt, ext = ("PNG", "png") if image.hasAlphaChannel() else ("JPG", "jpg")
+        buffer = QBuffer()
+        buffer.open(QBuffer.WriteOnly)
+        if not image.save(buffer, fmt, 85):
+            raise ValueError("이미지를 변환하지 못했습니다.")
+        self._set_picture(bytes(buffer.data()), ext)
+
+    def _set_picture_from_mime(self, mime) -> bool:
+        """클립보드/드롭 데이터에서 이미지를 꺼낸다. 성공하면 True."""
+        if mime is None:
+            return False
+
+        if mime.hasImage():
+            self._set_picture_from_image(QImage(mime.imageData()))
+            return True
+
+        for url in mime.urls():
+            if url.isLocalFile():
+                self._load_picture_file(url.toLocalFile())
+                return True
+            if url.scheme() in ("http", "https"):
+                self._download_picture(url.toString())
+                return True
+
+        return False
+
+    def _load_picture_file(self, path: str):
+        ext = os.path.splitext(path)[1].lstrip(".").lower()
+        if ext == "gif":
+            # GIF는 QImage로 다시 인코딩하면 애니메이션이 죽으므로 원본 그대로
+            with open(path, "rb") as f:
+                self._set_picture(f.read(), "gif")
+            return
+        self._set_picture_from_image(QImage(path))
+
+    def _download_picture(self, url: str):
+        """브라우저에서 이미지를 끌어다 놓으면 URL로 온다"""
+        import requests
+
+        res = requests.get(url, timeout=PICTURE_DOWNLOAD_TIMEOUT, stream=True)
+        res.raise_for_status()
+
+        content_type = res.headers.get("Content-Type", "")
+        if not content_type.startswith("image/"):
+            raise ValueError(f"이미지가 아닙니다 (Content-Type: {content_type or '알 수 없음'})")
+
+        data = b""
+        for chunk in res.iter_content(64 * 1024):
+            data += chunk
+            if len(data) > MAX_PICTURE_BYTES:
+                raise ValueError(
+                    f"이미지가 너무 큽니다 ({MAX_PICTURE_BYTES // (1024 * 1024)}MB 초과)."
+                )
+
+        if content_type == "image/gif":
+            self._set_picture(data, "gif")
+            return
+        self._set_picture_from_image(QImage.fromData(QByteArray(data)))
+
+    def _picture_error(self, e: Exception):
+        QMessageBox.warning(self, "이미지를 넣지 못했습니다", str(e))
+
+    # 버튼 / 단축키 / 드래그앤드롭
+
+    def paste_picture(self):
+        mime = QGuiApplication.clipboard().mimeData()
+
+        # 클립보드에 이미지가 있을 때만 가져간다. 그렇지 않으면
+        # 텍스트 편집 중의 평범한 Ctrl+V를 방해하지 않도록 넘겨준다.
+        if mime is not None and mime.hasImage():
+            try:
+                self._set_picture_from_mime(mime)
+            except Exception as e:
+                self._picture_error(e)
+            return
+
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QTextEdit, QLineEdit)):
+            focused.paste()
+        else:
+            QMessageBox.information(
+                self, "붙여넣기",
+                "클립보드에 이미지가 없습니다.\n"
+                "브라우저에서 이미지를 우클릭 → '이미지 복사' 후 다시 시도하세요."
+            )
+
+    def choose_picture_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "이미지 선택", "",
+            "이미지 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;모든 파일 (*)"
+        )
+        if not path:
+            return
+        try:
+            self._load_picture_file(path)
+        except Exception as e:
+            self._picture_error(e)
+
+    def clear_picture(self):
+        self.picture_data = None
+        self.picture_ext = "jpg"
+        self._refresh_picture_preview()
+
+    def open_image_search(self):
+        word = self._current_word()
+        if not word:
+            QMessageBox.information(self, "검색", "Word/Phrase가 비어 있습니다.")
+            return
+        QDesktopServices.openUrl(
+            QUrl(f"https://www.google.com/search?tbm=isch&q={quote_plus(word)}")
+        )
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasImage() or mime.hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        try:
+            if self._set_picture_from_mime(event.mimeData()):
+                event.acceptProposedAction()
+        except Exception as e:
+            self._picture_error(e)
+
+    # ── Anki 추가 ───────────────────────────────────────────────
+
     def add_to_anki(self):
         try:
             # Update card_data from edits
             updated_fields = {}
             for key, edit in self.edits.items():
                 updated_fields[key] = edit.toPlainText()
+
+            # 취소한 카드의 이미지가 미디어 폴더에 남지 않도록,
+            # 붙여넣는 시점이 아니라 추가하는 시점에 올린다.
+            if self.picture_data:
+                filename = anki_card_maker.store_media_image(
+                    self.picture_data, self.picture_ext
+                )
+                updated_fields["Picture"] = anki_card_maker.picture_html(filename)
 
             anki_fields = anki_card_maker.build_anki_fields(updated_fields)
 

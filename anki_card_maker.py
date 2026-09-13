@@ -17,6 +17,8 @@ Anki 카드 자동 생성기
 """
 
 import requests
+import base64
+import hashlib
 import json
 import re
 import shutil
@@ -530,7 +532,9 @@ def build_anki_fields(card: dict) -> dict:
     """
     카드 dict를 노트 유형의 8개 필드로 변환.
     CLI와 GUI가 각자 들고 있던 것을 한 곳으로 모았다.
-    Picture/Audio는 Anki에서 직접 채운다.
+
+    Picture는 미리보기 창에서 붙여넣은 <img> 태그가 들어온다 (없으면 빈 값).
+    Audio는 아직 Anki에서 직접 채운다.
     """
     return {
         "Word/Phrase":   card.get("Word/Phrase", ""),
@@ -539,9 +543,38 @@ def build_anki_fields(card: dict) -> dict:
         "KR_Definition": to_html(card.get("KR_Definition", "")),
         "EN_Definition": to_html(card.get("EN_Definition", "")),
         "Outline":       to_html(card.get("Outline", "")),
-        "Picture":       "",
+        "Picture":       card.get("Picture", ""),
         "Audio":         "",
     }
+
+
+def store_media_image(data: bytes, ext: str = "jpg") -> str:
+    """
+    이미지를 Anki 미디어 폴더에 저장하고 실제 저장된 파일명을 반환.
+
+    내용 해시를 파일명으로 써서 같은 이미지를 여러 카드에 붙여도 파일이 늘지 않는다.
+    (기존 노트의 paste-<sha1>.jpg 명명과 같은 결)
+    """
+    filename = f"paste-{hashlib.sha1(data).hexdigest()}.{ext}"
+    encoded = base64.b64encode(data).decode("ascii")
+
+    try:
+        stored = anki_request("storeMediaFile", filename=filename, data=encoded)
+    except AnkiError as e:
+        # anki_request는 오류 문구에 duplicate/empty가 있으면 노트 관련 예외로
+        # 바꾼다. 여기서는 이미지 저장 실패이므로 오해가 없도록 다시 감싼다.
+        raise AnkiError(f"이미지를 Anki에 저장하지 못했습니다: {e}") from e
+
+    # AnkiConnect가 이름을 바꿔 저장할 수 있으므로 돌려준 값을 쓴다
+    return stored or filename
+
+
+def picture_html(filename: str) -> str:
+    """
+    Picture 필드에 넣을 HTML.
+    크기는 노트 유형 CSS(.card img)가 max-height 200px로 잡으므로 지정하지 않는다.
+    """
+    return f'<img src="{filename}">'
 
 
 def add_note(fields: dict, allow_duplicate: bool = False) -> int:

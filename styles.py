@@ -90,6 +90,14 @@ QLabel#infoLabel {{
     font-size: 13px;
 }}
 
+QLabel#picturePreview {{
+    background-color: {COLOR_SURFACE};
+    border: 2px dashed {COLOR_BORDER};
+    border-radius: 8px;
+    color: {COLOR_TEXT_DIM};
+    font-size: 12px;
+}}
+
 QLabel#fieldLabel {{
     color: {COLOR_PRIMARY};
     font-weight: bold;
