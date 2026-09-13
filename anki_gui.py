@@ -207,7 +207,9 @@ class MainWindow(QMainWindow):
         count = api_counter.get_count()
         limit = api_counter.DAILY_LIMIT
         next_reset = api_counter.get_next_reset_str()
-        self.counter_label.setText(f"오늘 Gemini 사용: {count} / {limit}  (리셋: {next_reset} KST)")
+        # DAILY_LIMIT = 0 은 무제한을 뜻한다 (api_counter 참조)
+        quota = f"{count} / {limit}" if limit else f"{count}회 (한도 없음)"
+        self.counter_label.setText(f"오늘 Gemini 사용: {quota}  (리셋: {next_reset} KST)")
 
     def _update_profile_label(self):
         try:
