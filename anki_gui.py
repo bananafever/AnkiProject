@@ -8,8 +8,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal
 
+import agy_cli
 import anki_card_maker
-import api_counter
 from picture_input import PictureInputMixin
 from styles import get_styles, get_colors
 
@@ -488,11 +488,11 @@ class MainWindow(QMainWindow):
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
 
-        self.counter_label = QLabel()
-        self.counter_label.setObjectName("infoLabel")
-        self.counter_label.setAlignment(Qt.AlignCenter)
-        self._update_counter_label()
-        layout.addWidget(self.counter_label)
+        # agy는 구독 한도라 호출 횟수를 셀 필요가 없다. 어떤 모델로 도는지만 보여준다.
+        model_label = QLabel(f"Gemini 모델(agy): {agy_cli.model_name()}")
+        model_label.setObjectName("infoLabel")
+        model_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(model_label)
 
         self.profile_label = QLabel()
         self.profile_label.setObjectName("infoLabel")
@@ -509,7 +509,7 @@ class MainWindow(QMainWindow):
         for key, label in anki_card_maker.BACKENDS:
             self.backend_combo.addItem(label, key)
         self.backend_combo.setToolTip(
-            "Gemini API → Claude CLI: Gemini를 먼저 쓰고, 한도 초과 등으로 실패하면 Claude CLI로 자동 전환합니다."
+            "Gemini(agy) → Claude CLI: agy로 Gemini를 먼저 쓰고, 한도 초과 등으로 실패하면 Claude CLI로 자동 전환합니다."
         )
         backend_row.addWidget(self.backend_combo, 1)
         layout.addLayout(backend_row)
@@ -557,14 +557,6 @@ class MainWindow(QMainWindow):
 
     def _on_mode_changed(self):
         QApplication.instance().setStyleSheet(get_styles(self.children_mode_checkbox.isChecked()))
-
-    def _update_counter_label(self):
-        count = api_counter.get_count()
-        limit = api_counter.DAILY_LIMIT
-        next_reset = api_counter.get_next_reset_str()
-        # DAILY_LIMIT = 0 은 무제한을 뜻한다 (api_counter 참조)
-        quota = f"{count} / {limit}" if limit else f"{count}회 (한도 없음)"
-        self.counter_label.setText(f"오늘 Gemini 사용: {quota}  (리셋: {next_reset} KST)")
 
     def _update_profile_label(self):
         try:
@@ -631,7 +623,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(text)
 
     def handle_fallback(self, reason):
-        # Gemini가 막혔을 때. CLI는 느리므로 진행 표시를 불확정 상태로 바꾼다.
+        # agy가 막혀 Claude CLI로 넘어갈 때. CLI는 느리므로 진행 표시를 불확정 상태로 바꾼다.
         self.progress_bar.setRange(0, 0)
         self.status_label.setText(f"⚠️ {reason} → Claude CLI로 생성 중... (수십 초 걸릴 수 있습니다)")
 
@@ -686,7 +678,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Gemini 사용 한도 초과",
                                 f"{message}\n\n"
                                 "→ 잠시 후 다시 시도하거나,\n"
-                                "→ '생성 모델'을 'Gemini API → Claude CLI' 또는 'Claude CLI만'으로 바꿔주세요.")
+                                "→ '생성 모델'을 'Gemini(agy) → Claude CLI' 또는 'Claude CLI만'으로 바꿔주세요.")
         elif isinstance(error, acm.AnkiConnectionError):
             QMessageBox.critical(self, "Anki 연결 오류", message)
         elif isinstance(error, acm.AnkiError):
@@ -705,7 +697,6 @@ class MainWindow(QMainWindow):
         self.btn_generate.setText("카드 생성하기")
         self.input_field.setEnabled(True)
         self.backend_combo.setEnabled(True)
-        self._update_counter_label()
         self._update_profile_label()
 
 class GenerationWorker(QThread):
@@ -726,7 +717,7 @@ class GenerationWorker(QThread):
             anki_card_maker.anki_request("version")
 
             anki_card_maker.backend = self.backend
-            # Gemini 실패 시 Claude CLI 폴백 사실을 UI로 전달
+            # agy 실패 시 Claude CLI 폴백 사실을 UI로 전달
             anki_card_maker.on_fallback = self.fallback.emit
 
             all_cards = []

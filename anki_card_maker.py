@@ -1,6 +1,6 @@
 """
 Anki 카드 자동 생성기
-- Gemini API로 카드 내용 생성 (실패 시 Claude CLI로 자동 폴백)
+- Gemini(agy, Antigravity CLI)로 카드 내용 생성 (실패 시 Claude CLI로 자동 폴백)
 - AnkiConnect로 Anki에 카드 추가
 - 노트 유형 "01_EN_Voca_SYS" 1개로 Card 1(빈칸채우기) + Card 2(단어카드) 자동 생성
 
@@ -8,9 +8,11 @@ Anki 카드 자동 생성기
   python anki_card_maker.py
 
 사전 준비:
-  1. pip install google-genai requests python-dotenv
+  1. pip install requests python-dotenv
   2. Anki 실행 + AnkiConnect 애드온 설치 (코드: 2055492159)
-  3. .env 파일에 GEMINI_API_KEY 입력
+  3. agy 설치 후 한 번 실행해 Google 계정으로 로그인
+     irm https://antigravity.google/cli/install.ps1 | iex
+     (선택) .env에 AGY_MODEL=... 로 모델 변경, AGY_CLI_PATH=... 로 경로 지정
   4. (선택) Claude CLI 폴백을 쓰려면 claude 로그인
      npm install -g @anthropic-ai/claude-code
 
@@ -23,10 +25,8 @@ import json
 import re
 import shutil
 import subprocess
-import time
-from google import genai
-from config import GEMINI_API_KEY, ANKI_DECK_NAME, ANKI_MODEL_NAME, ENV_PATH
-import api_counter
+from config import ANKI_DECK_NAME, ANKI_MODEL_NAME
+import agy_cli
 
 # ── 예외 타입 ──────────────────────────────────────────────────
 # GUI가 한국어 문구를 부분 문자열로 비교해 분기하던 것을 타입으로 대체한다.
@@ -53,59 +53,36 @@ class GenerationError(CardMakerError):
 
 
 class GeminiQuotaError(CardMakerError):
-    """Gemini 사용 한도 초과"""
+    """Gemini(agy) 사용 한도 초과"""
 
-
-# ── Gemini 설정 ────────────────────────────────────────────────
-MODEL_ID = "gemini-2.5-flash-lite"  # Flash-Lite 모델 적용
-
-_client = None
-
-
-def _get_client():
-    """
-    Gemini 클라이언트를 처음 쓸 때 만든다.
-    import 시점에 만들면 .env를 못 찾았을 때 창이 뜨기도 전에 죽고,
-    패키징된 exe(console=False)에서는 아무 메시지도 남지 않는다.
-    Claude CLI만 쓰는 경우에는 키가 없어도 앱이 동작해야 한다.
-    """
-    global _client
-    if _client is None:
-        if not GEMINI_API_KEY:
-            raise RuntimeError(
-                "GEMINI_API_KEY를 찾을 수 없습니다.\n"
-                f"→ {ENV_PATH} 파일에 GEMINI_API_KEY=... 를 넣어주세요.\n"
-                "→ 또는 '생성 모델'을 'Claude CLI만'으로 바꿔주세요."
-            )
-        _client = genai.Client(api_key=GEMINI_API_KEY)
-    return _client
 
 # ── 생성 경로(백엔드) 설정 ──────────────────────────────────────
-BACKEND_AUTO = "auto"      # Gemini API → 실패 시 Claude CLI (기본)
-BACKEND_GEMINI = "gemini"  # Gemini API만 (폴백 없음)
+BACKEND_AUTO = "auto"      # Gemini(agy) → 실패 시 Claude CLI (기본)
+BACKEND_GEMINI = "gemini"  # Gemini(agy)만 (폴백 없음)
 BACKEND_CLAUDE = "claude"  # Claude CLI만
 
 # UI 표시 순서 = 이 순서. 첫 항목이 기본값이다.
 BACKENDS = [
-    (BACKEND_AUTO,   "Gemini API → Claude CLI (기본)"),
-    (BACKEND_GEMINI, "Gemini API만"),
+    (BACKEND_AUTO,   "Gemini(agy) → Claude CLI (기본)"),
+    (BACKEND_GEMINI, "Gemini(agy)만"),
     (BACKEND_CLAUDE, "Claude CLI만"),
 ]
 
 backend = BACKEND_AUTO  # 현재 선택된 생성 경로
 
-# ── Claude CLI 설정 ────────────────────────────────────────────
+# ── CLI 설정 ───────────────────────────────────────────────────
+AGY_TIMEOUT = 180         # 초. 카드 3장 배치도 보통 수십 초 안에 끝난다
 CLAUDE_CLI_TIMEOUT = 180  # 초. CLI는 API보다 느리므로 넉넉하게
 
 # 폴백이 일어날 때 호출되는 콜백 (GUI에서 상태 표시용). 인자: 사유 문자열
 on_fallback = None
 
-# 한도 초과가 확인된 카운터 기간. 여기 값이 현재 기간과 같으면 Gemini를 건너뛴다.
-# (한 번 한도가 차면 매 호출마다 429를 다시 맞을 이유가 없다)
-_gemini_blocked_period = None
+# 한도 초과가 확인되면 앱을 끌 때까지 agy를 건너뛴다.
+# (한 번 한도가 차면 매 호출마다 수십 초씩 기다려 같은 실패를 볼 이유가 없다)
+_agy_blocked = False
 
 
-# ── 0. LLM 호출 (Gemini → Claude CLI 폴백) ──────────────────────
+# ── 0. LLM 호출 (Gemini(agy) → Claude CLI 폴백) ─────────────────
 
 def _notify_fallback(reason: str):
     """폴백 발생을 UI에 알린다. 콜백이 없거나 실패해도 생성은 계속한다."""
@@ -116,58 +93,16 @@ def _notify_fallback(reason: str):
             pass
 
 
-def _blocked_reason(response) -> str:
-    """Gemini가 응답을 내주지 않았을 때 사유를 최대한 뽑아낸다"""
-    reason = None
+def _call_agy(prompt: str) -> str:
+    """
+    Gemini를 구독(agy)으로 호출.
+    재시도는 하지 않는다. 호출 한 번이 수십 초 걸리고,
+    형식이 틀린 응답은 _generate_json이 한 번 더 생성한다.
+    """
     try:
-        candidates = getattr(response, "candidates", None) or []
-        if candidates:
-            reason = getattr(candidates[0], "finish_reason", None)
-        if reason is None:
-            feedback = getattr(response, "prompt_feedback", None)
-            reason = getattr(feedback, "block_reason", None)
-    except Exception:
-        pass
-
-    detail = f" (사유: {reason})" if reason else ""
-    return (f"Gemini가 응답을 생성하지 않았습니다{detail}. "
-            "안전 필터에 걸렸을 수 있습니다.")
-
-
-def _call_gemini(prompt: str) -> str:
-    """Gemini API 호출. 429/503은 1초, 2초 간격으로 최대 3회 시도."""
-    limit = api_counter.DAILY_LIMIT
-    if limit and api_counter.get_count() >= limit:
-        # 표시만 하고 막지 않으면 카운터가 아무 의미가 없다.
-        # DAILY_LIMIT = 0 으로 두면 무제한.
-        raise GeminiQuotaError(
-            f"오늘 Gemini 사용 한도({limit}회)를 모두 썼습니다."
-        )
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            response = _get_client().models.generate_content(
-                model=MODEL_ID,
-                contents=prompt
-            )
-            # 안전 필터 등으로 차단되면 .text가 None이다.
-            # 카운터는 실제로 텍스트를 받은 뒤에만 올린다.
-            text = getattr(response, "text", None)
-            if text is None:
-                raise RuntimeError(_blocked_reason(response))
-            api_counter.increment()  # 성공 시 카운터 증가
-            return text.strip()
-        except Exception as e:
-            last_error = e
-            error_str = str(e).lower()
-            is_retryable = ("503" in error_str or "unavailable" in error_str
-                            or "429" in error_str)
-            if is_retryable and attempt < 2:
-                time.sleep(2 ** attempt)  # 1초, 2초 후 재시도
-                continue
-            break
-    raise last_error
+        return agy_cli.run_text(prompt, timeout=AGY_TIMEOUT)
+    except agy_cli.AgyQuotaExceeded as e:
+        raise GeminiQuotaError(str(e)) from e
 
 
 def _call_claude_cli(prompt: str) -> str:
@@ -209,69 +144,44 @@ def _call_claude_cli(prompt: str) -> str:
     return text
 
 
-def _is_quota_error(error_str: str) -> bool:
-    return ("429" in error_str or "quota" in error_str
-            or "resource_exhausted" in error_str
-            or "사용 한도" in error_str)
-
-
 def _gemini_error_message(e: Exception) -> str:
-    """폴백 없이 Gemini만 쓸 때 사용자에게 보여줄 메시지"""
-    error_str = str(e).lower()
-    if _is_quota_error(error_str):
-        return ("Gemini API 사용 한도(Quota)를 초과했습니다. "
-                "잠시 후 다시 시도하거나, 생성 모델을 'Claude CLI'로 바꿔주세요.")
-    if "503" in error_str or "unavailable" in error_str:
-        return ("현재 Gemini API 서버에 트래픽이 몰려 일시적으로 사용할 수 없거나 "
-                "지연되고 있습니다 (503 Unavailable). 잠시 후 다시 시도해주세요.")
+    """폴백 없이 Gemini(agy)만 쓸 때 사용자에게 보여줄 메시지"""
+    if isinstance(e, GeminiQuotaError):
+        return ("Gemini(agy) 사용 한도를 초과했습니다. "
+                f"잠시 후 다시 시도하거나, 생성 모델을 'Claude CLI'로 바꿔주세요.\n\n{e}")
     return str(e)
 
 
-def _gemini_is_blocked() -> bool:
-    """
-    Gemini 한도 초과 상태인지 확인.
-    카운터의 일일 리셋(KST 17시)이 지나면 자동으로 해제된다.
-    """
-    if _gemini_blocked_period is None:
-        return False
-    return _gemini_blocked_period == api_counter.load_usage()["period_start"]
-
-
 def _generate_text(prompt: str) -> str:
-    """선택된 백엔드로 생성. BACKEND_AUTO면 Gemini 실패 시 Claude CLI로 폴백."""
-    global _gemini_blocked_period
+    """선택된 백엔드로 생성. BACKEND_AUTO면 agy 실패 시 Claude CLI로 폴백."""
+    global _agy_blocked
 
     if backend == BACKEND_CLAUDE:
         return _call_claude_cli(prompt)
 
-    gemini_error = None
+    agy_error = None
 
-    if backend == BACKEND_AUTO and _gemini_is_blocked():
-        # 이미 한도가 찬 것이 확인됨 → Gemini를 건너뛰고 바로 폴백
-        reason = "Gemini 사용 한도 초과 (리셋 전까지 Claude CLI 사용)"
+    if backend == BACKEND_AUTO and _agy_blocked:
+        # 이미 한도가 찬 것이 확인됨 → agy를 건너뛰고 바로 폴백
+        reason = "Gemini(agy) 사용 한도 초과 (앱을 다시 켤 때까지 Claude CLI 사용)"
     else:
         try:
-            return _call_gemini(prompt)
+            return _call_agy(prompt)
         except Exception as e:
-            gemini_error = e
-            error_str = str(e).lower()
-            if _is_quota_error(error_str):
-                # 이번 기간 내내 폴백을 쓰도록 기록
-                _gemini_blocked_period = api_counter.load_usage()["period_start"]
-                reason = "Gemini 사용 한도 초과"
-            elif "503" in error_str or "unavailable" in error_str:
-                # 일시적 장애이므로 다음 호출에서는 다시 Gemini를 시도한다
-                reason = "Gemini 서버 일시 장애"
-            elif "응답을 생성하지 않았습니다" in str(e):
-                # 안전 필터 차단. 재시도해도 같으므로 폴백이 유일한 길이다
-                reason = "Gemini 응답 차단(안전 필터)"
+            agy_error = e
+            if isinstance(e, GeminiQuotaError):
+                # 앱을 다시 켤 때까지 폴백을 쓰도록 기록
+                _agy_blocked = True
+                reason = "Gemini(agy) 사용 한도 초과"
+            elif isinstance(e, agy_cli.AgyUnavailable):
+                reason = "agy를 찾을 수 없음"
             else:
-                reason = f"Gemini 오류 ({type(e).__name__})"
+                reason = f"Gemini(agy) 오류 ({type(e).__name__})"
 
             if backend == BACKEND_GEMINI:
-                # 폴백 없이 Gemini만 쓰도록 선택한 경우
+                # 폴백 없이 agy만 쓰도록 선택한 경우
                 message = _gemini_error_message(e)
-                if _is_quota_error(error_str) or isinstance(e, GeminiQuotaError):
+                if isinstance(e, GeminiQuotaError):
                     raise GeminiQuotaError(message) from e
                 raise GenerationError(message) from e
 
@@ -279,7 +189,7 @@ def _generate_text(prompt: str) -> str:
     try:
         return _call_claude_cli(prompt)
     except Exception as cli_error:
-        detail = f"→ Gemini: {gemini_error}\n" if gemini_error is not None else ""
+        detail = f"→ Gemini(agy): {agy_error}\n" if agy_error is not None else ""
         raise GenerationError(
             f"Claude CLI 폴백도 실패했습니다. (폴백 사유: {reason})\n"
             f"{detail}→ Claude CLI: {cli_error}"
@@ -342,7 +252,7 @@ def _generate_json(prompt: str, parse):
     """
     생성 후 JSON 파싱까지. 형식이 틀리면 한 번 더 생성한다.
     LLM이 예문 HTML에 큰따옴표를 섞어 JSON을 깨뜨리는 일이 잦은데,
-    전송 오류가 아니라서 _call_gemini의 재시도 루프로는 잡히지 않는다.
+    전송 오류가 아니라서 CLI 호출 쪽에서는 잡히지 않는다.
     """
     last_error = None
     for attempt in range(2):
@@ -654,7 +564,7 @@ def main():
             print("  ⚠️  단어/표현을 입력해주세요.\n")
             continue
 
-        print("  ⏳ Gemini로 카드 생성 중...")
+        print("  ⏳ Gemini(agy)로 카드 생성 중...")
         try:
             card = generate_card(topic)
 
