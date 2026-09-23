@@ -9,8 +9,6 @@ a = Analysis(
     ['anki_gui.py'],
     pathex=[],
     binaries=[],
-    # .py 모듈은 자동 번들되므로 넣지 않는다.
-    # checkmark.svg는 styles.py가 경로로 여는 자원이라 반드시 필요하다.
     datas=[('checkmark.svg', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
