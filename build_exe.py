@@ -10,7 +10,7 @@ def build_exe():
     app_name = "AnkiCardMaker"
     
     # 추가할 데이터나 파일이 있다면 여기에 작성 (예: 아이콘)
-    # .env는 일부러 넣지 않는다 (키를 exe에 박지 않기 위해). exe 옆에 두고 쓴다.
+    # .env는 일부러 넣지 않는다. 사용자가 exe 옆에 두고 고쳐 쓰는 설정 파일이다.
     datas = [
         # (source, destination)
     ]
@@ -34,7 +34,7 @@ def build_exe():
         "--add-data=checkmark.svg;.",
     ]
     
-    # .env 파일은 빌드된 exe와 같은 폴더에 있어야 작동함
+    # .env(선택)는 빌드된 exe와 같은 폴더에서 읽는다
     print("="*50)
     print(f"🚀 {app_name} EXE 빌드를 시작합니다...")
     print("="*50)
@@ -45,8 +45,9 @@ def build_exe():
     print("✅ 빌드가 완료되었습니다!")
     print(f"📁 생성된 파일 위치: {os.path.join(os.getcwd(), 'dist', app_name + '.exe')}")
     print("\n⚠️  주의사항:")
-    print("1. 실행 파일(.exe)과 같은 폴더에 '.env' 파일이 있어야 API 키를 인식합니다.")
-    print("2. Anki가 실행 중이고 AnkiConnect가 설치되어 있어야 정상 작동합니다.")
+    print("1. 카드 생성에는 agy(Antigravity CLI) 설치와 로그인이 필요합니다. (없으면 Claude CLI로 넘어갑니다)")
+    print("2. 모델을 바꾸려면 exe와 같은 폴더의 '.env'에 AGY_MODEL=... 를 적습니다. (선택)")
+    print("3. Anki가 실행 중이고 AnkiConnect가 설치되어 있어야 정상 작동합니다.")
     print("="*50)
 
 if __name__ == "__main__":
